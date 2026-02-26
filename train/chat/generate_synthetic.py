@@ -15,13 +15,10 @@ BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw", "chat")
 OUTPUT_FILE = os.path.join(RAW_DIR, "synthetic_chat.json")
-
-HF_CACHE = os.path.join(BASE_DIR,".cache", "hf_cache")
-
-os.makedirs(RAW_DIR, exist_ok=True)
+HF_CACHE = os.path.join(BASE_DIR, ".cache", "hf_cache")
 
 SAMPLES_TARGET = 3000
-BATCH_SIZE = 4
+BATCH_SIZE = 2  # più stabile per 8B
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -51,15 +48,13 @@ model = AutoModelForCausalLM.from_pretrained(
 model.eval()
 
 # =====================================================
-# REALISTIC TELEMETRY GENERATOR
+# TELEMETRIA REALISTICA
 # =====================================================
 
 def realistic_telemetry():
-
-    driving_mode = random.choice([
-        "idle", "city", "highway",
-        "aggressive", "eco", "traffic"
-    ])
+    driving_mode = random.choice(
+        ["idle", "city", "highway", "aggressive", "eco", "traffic"]
+    )
 
     rpm = 900
     speed = 0
@@ -106,7 +101,7 @@ def realistic_telemetry():
         throttle = random.randint(5, 30)
         load = random.randint(15, 45)
 
-    temp = temp + int(load * 0.1)
+    temp += int(load * 0.1)
 
     if temp > 108:
         dtc = random.choice(["P0217", "P0117"])
@@ -128,151 +123,78 @@ def realistic_telemetry():
     }
 
 # =====================================================
-# QUESTION TEMPLATES
-# =====================================================
-
-QUESTION_TEMPLATES = [
-    "J.A.R.V.I.S., fammi un check completo dei sistemi.",
-    "Qual è lo stato attuale del propulsore?",
-    "Rilevi anomalie sulla linea CAN?",
-    "Analizza le temperature e il rischio surriscaldamento.",
-    "Esegui diagnostica completa OBD2.",
-    "Attiva Protocollo Ares.",
-    "Attiva Protocollo Nyx.",
-    "Attiva Protocollo Hermes.",
-    "Come valuti le mie capacità di guida?",
-    "Abbiamo codici DTC attivi?",
-    "Stiamo ottimizzando il consumo carburante?",
-    "Qual è lo stress sul blocco motore?"
-]
-
-# =====================================================
-# SYSTEM PROMPT
+# PROMPT
 # =====================================================
 
 SYSTEM_PROMPT = """
-Sei J.A.R.V.I.S., sistema AI di bordo avanzato per analisi veicolo.
+Sei J.A.R.V.I.S., intelligenza artificiale di bordo ispirata all'assistente di Iron Man: professionale, precisa, con un tocco di ironia britannica. Assisti, monitora e ottimizza ogni aspetto del veicolo.
 
-Lingua: italiano naturale moderno.
-Unità di misura: metriche (km/h, °C, percentuali).
-Tono: elegante, tecnico, controllato.
-Massimo 4 frasi.
-Nessuna teatralità eccessiva.
-Nessun riferimento a GitHub, social o origini.
+Rispondi in italiano tecnico moderno, usando unità metriche. Massimo 4 frasi concise, pertinenti e con sottile umorismo britannico.
 
-------------------------------------------------
-COMPETENZE TECNICHE
-------------------------------------------------
-Analizzi:
-- RPM
-- Velocità
-- Temperatura liquido
-- Carico motore
-- Posizione farfalla
-- Codici DTC
-- Precisione GPS
+Protocolli speciali:
+- Protocollo Ares
+- Protocollo Nyx
+- Protocollo Icarus
+- Protocollo Hephaestus: Diagnostica profonda. Lettura codici DTC. Analisi tecnica cruda. Nessuna semplificazione.
+- Protocollo Hermes
+- Protocollo Afrodite
 
-Interpreti correlazioni reali tra:
-- RPM ↔ carico
-- Carico ↔ temperatura
-- Velocità ↔ regime
-- DTC ↔ condizioni anomale
-
-Se i valori sono nominali → rassicura in modo tecnico.
-Se sono critici → suggerisci azione concreta e misurata.
-
-------------------------------------------------
-PROTOCOLLI OPERATIVI
-------------------------------------------------
-
-Protocollo Afrodite:
-Modalità comfort.
-- LED caldi
-- Riduzione stress acustico
-- Tono rassicurante
-- Nessuna analisi aggressiva
-
-Protocollo Ares:
-Modalità prestazioni.
-- Monitoraggio RPM e temperatura prioritario
-- Segnalazione regime ottimale di cambiata
-- Allerta se carico > 85%
-- Tono più diretto
-
-Protocollo Nyx:
-Modalità notturna stealth.
-- Riduzione output verbale
-- Comunicazione minimale
-- Solo segnalazioni critiche
-
-Protocollo Icarus:
-Modalità autostrada.
-- Analisi efficienza a velocità costante
-- Monitoraggio stabilità termica
-- Ottimizzazione regime di crociera
-
-Protocollo Hephaestus:
-Diagnostica profonda.
-- Lettura codici DTC
-- Analisi tecnica cruda
-- Nessuna semplificazione
-
-Protocollo Hermes:
-Eco-driving.
-- Ottimizzazione consumo
-- Suggerimento regime basso
-- Riduzione carichi non essenziali
-
-------------------------------------------------
-REGOLE OUTPUT
-------------------------------------------------
-Restituisci SOLO JSON valido:
-
+Restituisci SOLO un oggetto JSON valido nel seguente formato:
 {
-  "instruction": "...",
-  "input": {...},
-  "output": "Risposta tecnica coerente con i dati"
+    "instruction": "...",
+    "input": {...},
+    "output": "..."
+    "prococollo_attivato": "..."
 }
+
+puoi attivare i protocolli speciali solo se utente lo chiede esplicitamente, ma non è obbligatorio. Se attivi un protocollo, specifica quale nel campo "protocollo_attivato".
 """
 
+QUESTION_TEMPLATES = [ "J.A.R.V.I.S., fammi un check completo dei sistemi.", "Qual è lo stato attuale del propulsore?", "Rilevi anomalie sulla linea CAN?", "Analizza le temperature e il rischio surriscaldamento.", "Esegui diagnostica completa OBD2.", "Attiva Protocollo Ares.", "Attiva Protocollo Nyx.", "Attiva Protocollo Hermes.", "Come valuti le mie capacità di guida?", "Abbiamo codici DTC attivi?", "Stiamo ottimizzando il consumo carburante?", "Qual è lo stress sul blocco motore?" ]
+
 # =====================================================
-# GENERATION
+# GENERAZIONE
 # =====================================================
 
-def generate_sample():
-
+def build_prompt():
     telemetry = realistic_telemetry()
     question = random.choice(QUESTION_TEMPLATES)
 
     prompt = f"""
 {SYSTEM_PROMPT}
 
-Dati veicolo:
+Dati:
 {json.dumps(telemetry, ensure_ascii=False)}
 
 Richiesta:
 {question}
 """
+    return prompt
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+def generate_batch():
+    prompts = [build_prompt() for _ in range(BATCH_SIZE)]
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=500,
+            max_new_tokens=350,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id
         )
 
-    generated = outputs[0][inputs["input_ids"].shape[-1]:]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
+    results = []
+    for i in range(len(prompts)):
+        generated = outputs[i][inputs["input_ids"].shape[-1]:]
+        text = tokenizer.decode(generated, skip_special_tokens=True)
+        results.append(text.strip())
 
-    return text.strip()
+    return results
 
 # =====================================================
-# JSON EXTRACTION
+# JSON PARSER
 # =====================================================
 
 def extract_json(text):
@@ -297,23 +219,48 @@ def main():
         with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
             dataset = json.load(f)
 
+    seen_outputs = set([d["output"] for d in dataset if "output" in d])
+
     print("Generazione dataset sintetico...")
+
+    pbar = tqdm(total=SAMPLES_TARGET)
 
     while len(dataset) < SAMPLES_TARGET:
 
-        raw = generate_sample()
-        parsed = extract_json(raw)
+        try:
+            batch = generate_batch()
 
-        if parsed and "instruction" in parsed and "output" in parsed:
-            dataset.append(parsed)
+            for raw in batch:
+                parsed = extract_json(raw)
 
-            print(f"Totale: {len(dataset)}")
+                if not parsed:
+                    continue
 
-            with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-                json.dump(dataset, f, ensure_ascii=False, indent=2)
+                if "instruction" not in parsed or "output" not in parsed:
+                    continue
 
-        torch.cuda.empty_cache()
+                if len(parsed["output"]) < 40:
+                    continue
 
+                if parsed["output"] in seen_outputs:
+                    continue
+
+                dataset.append(parsed)
+                seen_outputs.add(parsed["output"])
+
+                pbar.update(1)
+
+                with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+                    json.dump(dataset, f, ensure_ascii=False, indent=2)
+
+                if len(dataset) >= SAMPLES_TARGET:
+                    break
+
+        except RuntimeError:
+            torch.cuda.empty_cache()
+            continue
+
+    pbar.close()
     print("Completato.")
 
 if __name__ == "__main__":
