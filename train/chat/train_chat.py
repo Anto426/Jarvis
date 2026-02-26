@@ -7,7 +7,7 @@ from transformers import GPT2LMHeadModel, Trainer, TrainingArguments
 
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
-TOKENS_DB = os.path.join(BASE_DIR, "data", "tokens", "chat_tokens.db")
+TOKENS_DB = os.path.join(BASE_DIR, "data", "tokens","raw", "chat_tokens.db")
 MODEL_DIR = os.path.join(BASE_DIR, "jarvis_model")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

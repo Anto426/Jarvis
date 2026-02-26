@@ -5,8 +5,8 @@ import sqlite3
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 RAW_FILE = os.path.join(BASE_DIR, "data", "raw", "personal", "persona.json")
-PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-DB_FILE = os.path.join(PROCESSED_DIR, "personal.db")
+PROCESSED_DIR = os.path.join(BASE_DIR, "data","raw", "db")
+DB_FILE = os.path.join(PROCESSED_DIR , "personal.db")
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 

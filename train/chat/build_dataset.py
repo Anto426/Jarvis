@@ -5,7 +5,7 @@ import sqlite3
 BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 RAW_FILE = os.path.join(BASE_DIR, "data", "raw", "chat", "synthetic_chat.json")
-PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+PROCESSED_DIR = os.path.join(BASE_DIR, "data","raw", "db")
 DB_FILE = os.path.join(PROCESSED_DIR, "chat.db")
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -45,7 +45,7 @@ def main():
     conn.commit()
     conn.close()
 
-    print("Chat DB creato in processed/")
+    print(f"Chat DB creato in {PROCESSED_DIR}")
 
 if __name__ == "__main__":
     main()
