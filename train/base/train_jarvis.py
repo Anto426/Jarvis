@@ -10,6 +10,7 @@ from transformers import (
     Trainer,
     TrainingArguments
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 # ==========================
 # CONFIG
@@ -18,8 +19,6 @@ from transformers import (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 TOKENS_DB = os.path.join(BASE_DIR, "data", "tokens.db")
-PERSONA_TOKENS_DB = os.path.join(BASE_DIR, "data", "persona_tokens.db")
-
 OUTPUT_DIR = os.path.join(BASE_DIR, "jarvis_model")
 
 VOCAB_SIZE = 32000
@@ -47,7 +46,7 @@ def db_generator(db_path):
             }
 
 # ==========================
-# TRAIN STAGE FUNCTION
+# TRAIN FUNCTION
 # ==========================
 
 def train_stage(model, db_path, epochs, lr):
@@ -70,16 +69,16 @@ def train_stage(model, db_path, epochs, lr):
         gradient_accumulation_steps=4,
         eval_strategy="steps",
         eval_steps=1000,
-        save_steps=1000,
+        save_steps=2000,
         save_total_limit=2,
         logging_steps=50,
         warmup_steps=100,
         learning_rate=lr,
-        weight_decay=0.1,
+        weight_decay=0.01,
         lr_scheduler_type="cosine",
         bf16=torch.cuda.is_available(),
         gradient_checkpointing=True,
-        dataloader_num_workers=0,  # Windows stabile
+        dataloader_num_workers=0,
         dataloader_pin_memory=True,
         remove_unused_columns=False,
         report_to="none"
@@ -106,7 +105,7 @@ def main():
     if not os.path.exists(TOKENS_DB):
         raise FileNotFoundError("tokens.db non trovato.")
 
-    print("Initializing base model...")
+    print("Initializing model...")
 
     config = GPT2Config(
         vocab_size=VOCAB_SIZE,
@@ -117,16 +116,26 @@ def main():
         n_head=16,
         resid_pdrop=0.1,
         embd_pdrop=0.1,
-        attn_pdrop=0.1
+        attn_pdrop=0.1,
+        tie_word_embeddings=True
     )
 
-    model = GPT2LMHeadModel(config).to(DEVICE)
+    # Check ultimo checkpoint
+    last_checkpoint = None
+    if os.path.isdir(OUTPUT_DIR):
+        last_checkpoint = get_last_checkpoint(OUTPUT_DIR)
 
-    # ======================
-    # STAGE 1 — BASE TRAIN
-    # ======================
+    if last_checkpoint:
+        print(f"Riprendo SOLO i pesi da: {last_checkpoint}")
+        model = GPT2LMHeadModel.from_pretrained(last_checkpoint).to(DEVICE)
+    else:
+        print("Nessun checkpoint trovato. Inizializzo modello nuovo.")
+        model = GPT2LMHeadModel(config).to(DEVICE)
 
-    print("\n=== STAGE 1: BASE PRETRAINING ===")
+    model.config.use_cache = False
+
+    print("\n=== BASE PRETRAINING ===")
+
     model = train_stage(
         model,
         TOKENS_DB,
@@ -134,25 +143,11 @@ def main():
         lr=2e-4
     )
 
-    # ======================
-    # STAGE 2 — PERSONA
-    # ======================
-
-    if os.path.exists(PERSONA_TOKENS_DB):
-
-        print("\n=== STAGE 2: PERSONA FINE-TUNING ===")
-
-        model = train_stage(
-            model,
-            PERSONA_TOKENS_DB,
-            epochs=2,
-            lr=5e-5  # LR più basso per non distruggere il linguaggio
-        )
-
     print("\nTraining completato.")
     print(f"Modello salvato in: {OUTPUT_DIR}")
 
 # ==========================
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()

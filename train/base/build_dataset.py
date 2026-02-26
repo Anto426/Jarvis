@@ -12,7 +12,7 @@ from datasets import load_dataset
 # CONFIG
 # =====================================================
 
-BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "raw")
 DB_PATH = os.path.join(BASE_DIR, "dataset.db")
 
 CHUNK_SIZE = 1200
