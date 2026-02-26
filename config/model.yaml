@@ -1,0 +1,44 @@
+model:
+  # =========================
+  # VOCAB & CONTEXT
+  # =========================
+  vocab_size: 32000
+  max_position_embeddings: 2048
+
+  # =========================
+  # ARCHITETTURA (≈700M)
+  # =========================
+  hidden_size: 1536
+  num_hidden_layers: 24
+  num_attention_heads: 16
+  intermediate_size: 6144
+
+  # =========================
+  # ATTENTION
+  # =========================
+  rotary_pct: 1.0
+  rotary_emb_base: 10000
+  use_parallel_residual: true
+
+  # =========================
+  # NORMALIZATION
+  # =========================
+  layer_norm_eps: 1e-5
+  rms_norm: true
+
+  # =========================
+  # DROPOUT
+  # =========================
+  hidden_dropout: 0.1
+  attention_dropout: 0.1
+
+  # =========================
+  # ACTIVATION
+  # =========================
+  hidden_act: "gelu"
+
+  # =========================
+  # INIT
+  # =========================
+  initializer_range: 0.02
+  tie_word_embeddings: true

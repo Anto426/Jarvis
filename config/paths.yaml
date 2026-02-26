@@ -1,0 +1,19 @@
+paths:
+  # =========================
+  # DATA
+  # =========================
+  raw_data_dir: "data/raw/"
+  cleaned_data_dir: "data/cleaned/"
+  shards_dir: "data/shards/"
+  tokenizer_dir: "data/tokenizer/"
+
+  # =========================
+  # MODEL
+  # =========================
+  model_output_dir: "checkpoints/"
+  final_model_dir: "model/"
+
+  # =========================
+  # LOGS
+  # =========================
+  logs_dir: "logs/"

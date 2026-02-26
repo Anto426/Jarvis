@@ -1,6 +1,4 @@
-.venv312
-__pycache__/
 data/
 .cache/
-tokenizer
-jarvis_model
+venv/
+__pycache__/

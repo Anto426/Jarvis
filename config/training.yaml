@@ -1,0 +1,44 @@
+training:
+  # =========================
+  # BATCHING
+  # =========================
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  eval_batch_size: 1
+
+  # =========================
+  # OPTIMIZER
+  # =========================
+  learning_rate: 2e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  max_grad_norm: 1.0
+
+  # =========================
+  # SCHEDULER
+  # =========================
+  scheduler: "cosine"
+  warmup_ratio: 0.03
+
+  # =========================
+  # TRAINING CONTROL
+  # =========================
+  num_train_epochs: 1
+  max_steps: null
+  logging_steps: 50
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 3
+
+  # =========================
+  # PRECISION
+  # =========================
+  mixed_precision: "fp16"
+  gradient_checkpointing: true
+
+  # =========================
+  # DATA
+  # =========================
+  dataloader_num_workers: 4
+  pin_memory: true
