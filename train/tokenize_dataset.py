@@ -10,40 +10,44 @@ from transformers import PreTrainedTokenizerFast
 # CONFIG
 # =====================================================
 
-BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+dataset_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
-PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
-TOKENS_DIR = os.path.join(BASE_DIR, "data", "tokens")
-TOKENIZER_DIR = os.path.join(BASE_DIR, "data", "tokenizer")
+PROCESSED_DIR = os.path.join(dataset_DIR, "data", "processed")
+TOKENS_DIR = os.path.join(dataset_DIR, "data", "tokens")
+TOKENIZER_DIR = os.path.join(dataset_DIR, "data", "tokenizer")
 
 VOCAB_SIZE = 32000
 BLOCK_SIZE = 512
-TRAIN_LIMIT = None
 
 os.makedirs(TOKENS_DIR, exist_ok=True)
 os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
 # =====================================================
-# TOKENIZER CREATION (AUTO)
+# TOKENIZER CREATION
 # =====================================================
 
-def train_tokenizer():
+def train_tokenizer(force_rebuild=False):
 
     vocab_file = os.path.join(TOKENIZER_DIR, "vocab.json")
+
+    if force_rebuild and os.path.exists(TOKENIZER_DIR):
+        print("Ricreazione completa tokenizer...")
+        for f in os.listdir(TOKENIZER_DIR):
+            os.remove(os.path.join(TOKENIZER_DIR, f))
 
     if os.path.exists(vocab_file):
         print("Tokenizer già presente.")
         return
 
-    base_db = os.path.join(PROCESSED_DIR, "base.db")
+    dataset_db = os.path.join(PROCESSED_DIR, "dataset.db")
 
-    if not os.path.exists(base_db):
-        raise FileNotFoundError("base.db necessario per creare il tokenizer.")
+    if not os.path.exists(dataset_db):
+        raise FileNotFoundError("dataset.db necessario per creare il tokenizer.")
 
-    print("Training tokenizer base...")
+    print("Training tokenizer dataset...")
 
     def text_iterator(batch_size=10000):
-        conn = sqlite3.connect(base_db)
+        conn = sqlite3.connect(dataset_db)
         cur = conn.cursor()
         cur.execute("SELECT text FROM samples")
 
@@ -65,7 +69,6 @@ def train_tokenizer():
     )
 
     tokenizer.save_model(TOKENIZER_DIR)
-
     print("Tokenizer creato.")
 
 # =====================================================
@@ -74,13 +77,13 @@ def train_tokenizer():
 
 def load_tokenizer():
 
-    base = ByteLevelBPETokenizer(
+    dataset = ByteLevelBPETokenizer(
         vocab=os.path.join(TOKENIZER_DIR, "vocab.json"),
         merges=os.path.join(TOKENIZER_DIR, "merges.txt")
     )
 
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=base._tokenizer,
+        tokenizer_object=dataset._tokenizer,
         bos_token="<s>",
         eos_token="</s>",
         unk_token="<unk>",
@@ -93,16 +96,22 @@ def load_tokenizer():
 # TOKENIZE DB
 # =====================================================
 
-def tokenize_db(dataset_name):
+def tokenize_db(dataset_name, force_rebuild=False):
 
     input_db = os.path.join(PROCESSED_DIR, f"{dataset_name}.db")
     output_db = os.path.join(TOKENS_DIR, f"{dataset_name}_tokens.db")
 
     if not os.path.exists(input_db):
-        raise FileNotFoundError(f"{input_db} non trovato.")
+        print(f"{dataset_name}.db non trovato, salto.")
+        return
+
+    if force_rebuild and os.path.exists(output_db):
+        print(f"Ricreo {dataset_name}_tokens.db")
+        os.remove(output_db)
 
     if os.path.exists(output_db):
-        os.remove(output_db)
+        print(f"{dataset_name} già tokenizzato.")
+        return
 
     tokenizer = load_tokenizer()
 
@@ -168,17 +177,20 @@ def tokenize_db(dataset_name):
 
 def main():
 
-    if len(sys.argv) != 2:
-        print("Uso: python tokenize_dataset.py [base|chat|personal]")
+    if len(sys.argv) < 2:
+        print("Uso: python tokenize_dataset.py [dataset|chat|personal|all] [--rebuild]")
         return
 
     dataset_name = sys.argv[1]
+    force_rebuild = "--rebuild" in sys.argv
 
-    # 1️⃣ Assicura tokenizer
-    train_tokenizer()
+    train_tokenizer(force_rebuild=force_rebuild)
 
-    # 2️⃣ Tokenizza
-    tokenize_db(dataset_name)
+    if dataset_name == "all":
+        for name in ["dataset", "chat", "personal"]:
+            tokenize_db(name, force_rebuild=force_rebuild)
+    else:
+        tokenize_db(dataset_name, force_rebuild=force_rebuild)
 
     print("Completato.")
 
