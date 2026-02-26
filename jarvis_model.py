@@ -10,7 +10,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_ROOT = os.path.join(BASE_DIR, "jarvis_model")
-TOKENIZER_DIR = os.path.join(BASE_DIR, "tokenizer")
+TOKENIZER_DIR = os.path.join(BASE_DIR, "data", "tokenizer")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
