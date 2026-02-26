@@ -20,26 +20,35 @@ os.makedirs(RAW_DIR, exist_ok=True)
 
 USE_WIKIPEDIA = True
 USE_MC4 = True
+USE_STACKEXCHANGE = True
+
 MC4_LIMIT = 500_000
+STACK_LIMIT = 300_000
+
+MIN_TEXT_LENGTH = 200
 
 # =========================
 # HELPERS
 # =========================
 
-def save_jsonl(dataset_iterator, output_file, text_field="text", limit=None):
+def save_jsonl(iterator, output_file, text_extractor, limit=None):
 
     with open(output_file, "w", encoding="utf-8") as f:
-        for i, sample in enumerate(tqdm(dataset_iterator)):
+
+        for i, sample in enumerate(tqdm(iterator)):
+
             if limit and i >= limit:
                 break
 
-            text = sample.get(text_field, "")
-            if text and len(text) > 200:
+            text = text_extractor(sample)
+
+            if text and len(text) >= MIN_TEXT_LENGTH:
                 json.dump({"text": text}, f, ensure_ascii=False)
                 f.write("\n")
 
+
 # =========================
-# MAIN
+# WIKIPEDIA
 # =========================
 
 def collect_wikipedia():
@@ -55,10 +64,18 @@ def collect_wikipedia():
 
     output_file = os.path.join(RAW_DIR, "wikipedia_it.jsonl")
 
-    save_jsonl(dataset, output_file)
+    save_jsonl(
+        dataset,
+        output_file,
+        text_extractor=lambda x: x.get("text", "")
+    )
 
     print("Wikipedia salvata.")
 
+
+# =========================
+# MC4
+# =========================
 
 def collect_mc4():
 
@@ -73,10 +90,70 @@ def collect_mc4():
 
     output_file = os.path.join(RAW_DIR, "mc4_it.jsonl")
 
-    save_jsonl(dataset, output_file, limit=MC4_LIMIT)
+    save_jsonl(
+        dataset,
+        output_file,
+        text_extractor=lambda x: x.get("text", ""),
+        limit=MC4_LIMIT
+    )
 
     print("MC4 salvato.")
 
+
+# =========================
+# STACKEXCHANGE AUTOMOTIVE
+# =========================
+
+def collect_stackexchange():
+
+    print("Scarico StackExchange...")
+
+    dataset = load_dataset(
+        "HuggingFaceH4/stack-exchange-preferences",
+        split="train",
+        streaming=True
+    )
+
+    output_file = os.path.join(RAW_DIR, "stackexchange_auto.jsonl")
+
+    automotive_keywords = [
+        # Inglese tecnico
+        "engine", "car", "vehicle", "OBD", "ECU",
+        "sensor", "brake", "battery", "transmission",
+        "diesel", "petrol", "hybrid", "electric",
+        "torque", "throttle", "gearbox", "clutch",
+        # Italiano
+        "motore", "automobile", "veicolo", "benzina",
+        "freni", "batteria", "centralina",
+        "cambio", "frizione", "sensore"
+    ]
+
+    def extract_text(sample):
+
+        question = sample.get("question", "")
+        response = sample.get("response", "")
+
+        text = question + "\n" + response
+        text_lower = text.lower()
+
+        if any(k in text_lower for k in automotive_keywords):
+            return text
+
+        return ""
+
+    save_jsonl(
+        dataset,
+        output_file,
+        text_extractor=extract_text,
+        limit=STACK_LIMIT
+    )
+
+    print("StackExchange automotive salvato.")
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
 
@@ -85,6 +162,9 @@ def main():
 
     if USE_MC4:
         collect_mc4()
+
+    if USE_STACKEXCHANGE:
+        collect_stackexchange()
 
     print("Collect completato.")
 
