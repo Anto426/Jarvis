@@ -1,26 +1,36 @@
 import os
-import yaml
 from datasets import load_dataset
 
-def load_training_dataset():
+def load_training_dataset(split_validation=False, val_ratio=0.02):
 
-    with open("config/paths.yaml", "r") as f:
-        paths = yaml.safe_load(f)["paths"]
+    data_path = r"data\shards"
 
-    shard_dir = paths["shards_dir"]
-
-    files = [
-        os.path.join(shard_dir, f)
-        for f in os.listdir(shard_dir)
-        if f.startswith("packed_") and f.endswith(".parquet")
-    ]
+    print("CWD:", os.getcwd())
+    print("Looking for:", os.path.abspath(data_path))
+    print("Exists:", os.path.exists(data_path))
 
     dataset = load_dataset(
         "parquet",
-        data_files=files,
-        split="train"
+        data_files={
+            "train": os.path.join(data_path, "packed_*.parquet")
+        }
+    )["train"]
+
+    # ✅ SOLO input_ids
+    dataset.set_format(
+        type="torch",
+        columns=["input_ids"]
     )
 
-    dataset = dataset.with_format("torch")
+    if not split_validation:
+        return dataset
 
-    return dataset
+    split = dataset.train_test_split(
+        test_size=val_ratio,
+        seed=42
+    )
+
+    split["train"].set_format(type="torch", columns=["input_ids"])
+    split["test"].set_format(type="torch", columns=["input_ids"])
+
+    return split["train"], split["test"]

@@ -10,6 +10,8 @@ def initialize_model(device="cuda"):
 
     model.to(device)
 
+    model.config.use_cache = False
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model initialized with {total_params / 1e6:.2f}M parameters")
 
