@@ -13,32 +13,31 @@ from models.init_model import initialize_model
 from training.dataset import load_training_dataset
 from training.scheduler import build_scheduler
 from training.utils import count_parameters
+from training.paths import configure_cache_env, get_path
 
 
-CHECKPOINT_DIR = "checkpoints"
-MAX_CHECKPOINTS = 2
 SAVE_EVERY_MINUTES = 5
 SAVE_INTERVAL = SAVE_EVERY_MINUTES * 60
 
 
-def rotate_checkpoints():
+def rotate_checkpoints(checkpoint_dir, max_checkpoints):
     checkpoints = sorted(
-        [d for d in os.listdir(CHECKPOINT_DIR) if d.startswith("step_")],
-        key=lambda x: int(x.split("_")[1])
+        [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+        key=lambda x: int(x.name.split("_")[1])
     )
 
-    while len(checkpoints) > MAX_CHECKPOINTS:
+    while len(checkpoints) > max_checkpoints:
         old = checkpoints.pop(0)
-        shutil.rmtree(os.path.join(CHECKPOINT_DIR, old))
+        shutil.rmtree(old)
 
 
-def get_latest_checkpoint():
-    if not os.path.exists(CHECKPOINT_DIR):
+def get_latest_checkpoint(checkpoint_dir):
+    if not checkpoint_dir.exists():
         return None
 
     checkpoints = [
-        d for d in os.listdir(CHECKPOINT_DIR)
-        if d.startswith("step_")
+        d for d in checkpoint_dir.iterdir()
+        if d.is_dir() and d.name.startswith("step_")
     ]
 
     if not checkpoints:
@@ -46,35 +45,37 @@ def get_latest_checkpoint():
 
     checkpoints = sorted(
         checkpoints,
-        key=lambda x: int(x.split("_")[1])
+        key=lambda x: int(x.name.split("_")[1])
     )
 
-    return os.path.join(CHECKPOINT_DIR, checkpoints[-1])
+    return checkpoints[-1]
 
 
-def save_checkpoint(accelerator, model, optimizer, scheduler, step):
-    save_path = os.path.join(CHECKPOINT_DIR, f"step_{step}")
-    os.makedirs(save_path, exist_ok=True)
+def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints):
+    save_path = checkpoint_dir / f"step_{step}"
+    save_path.mkdir(parents=True, exist_ok=True)
 
-    accelerator.save_state(save_path)
-    rotate_checkpoints()
+    accelerator.save_state(str(save_path))
+    rotate_checkpoints(checkpoint_dir, max_checkpoints)
 
     accelerator.print(f"\n💾 Checkpoint salvato: {save_path}\n")
 
 
 def main():
 
-    accelerator = Accelerator(mixed_precision="fp16")
-
+    configure_cache_env()
     with open("config/training.yaml", "r") as f:
         train_cfg = yaml.safe_load(f)["training"]
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    accelerator = Accelerator(mixed_precision=train_cfg["mixed_precision"])
+    checkpoint_dir = get_path("model_output_dir", create=True)
+    max_checkpoints = int(train_cfg.get("save_total_limit", 2))
 
     dataset, val_dataset = load_training_dataset(split_validation=True)
 
-    model = initialize_model()
-    model.gradient_checkpointing_enable()
+    model = initialize_model(device=None)
+    if train_cfg["gradient_checkpointing"]:
+        model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
     accelerator.print(f"\n🚀 Model: {count_parameters(model)/1e6:.2f}M parameters\n")
@@ -117,13 +118,13 @@ def main():
     )
 
     # 🔥 AUTO RESUME
-    latest_checkpoint = get_latest_checkpoint()
+    latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
     global_step = 0
 
     if latest_checkpoint:
         accelerator.print(f"\n🔄 Ripristino da {latest_checkpoint}\n")
-        accelerator.load_state(latest_checkpoint)
-        global_step = int(latest_checkpoint.split("_")[-1])
+        accelerator.load_state(str(latest_checkpoint))
+        global_step = int(latest_checkpoint.name.split("_")[-1])
 
     accumulation_steps = train_cfg["gradient_accumulation_steps"]
     last_save_time = time.time()
@@ -190,10 +191,9 @@ def main():
                         if accelerator.is_main_process:
                             save_checkpoint(
                                 accelerator,
-                                model,
-                                optimizer,
-                                scheduler,
-                                global_step
+                                global_step,
+                                checkpoint_dir,
+                                max_checkpoints
                             )
                         last_save_time = current_time
 
@@ -229,10 +229,9 @@ def main():
         if accelerator.is_main_process:
             save_checkpoint(
                 accelerator,
-                model,
-                optimizer,
-                scheduler,
-                global_step
+                global_step,
+                checkpoint_dir,
+                max_checkpoints
             )
 
     accelerator.print("\n🔥 Training completato.")

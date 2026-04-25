@@ -1,18 +1,16 @@
 import os
 import json
-from datasets import load_dataset
 from tqdm import tqdm
-import yaml
+from training.paths import configure_cache_env, get_path
 
 # =========================
 # LOAD PATHS
 # =========================
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
+configure_cache_env()
+from datasets import load_dataset
 
-RAW_DIR = paths["raw_data_dir"]
-os.makedirs(RAW_DIR, exist_ok=True)
+RAW_DIR = get_path("raw_data_dir", create=True)
 
 # =========================
 # CONFIG
@@ -59,7 +57,8 @@ def collect_wikipedia():
         "wikipedia",
         "20220301.it",
         split="train",
-        streaming=True
+        streaming=True,
+        cache_dir=os.environ.get("HF_DATASETS_CACHE")
     )
 
     output_file = os.path.join(RAW_DIR, "wikipedia_it.jsonl")
@@ -85,7 +84,8 @@ def collect_mc4():
         "mc4",
         "it",
         split="train",
-        streaming=True
+        streaming=True,
+        cache_dir=os.environ.get("HF_DATASETS_CACHE")
     )
 
     output_file = os.path.join(RAW_DIR, "mc4_it.jsonl")
@@ -111,7 +111,8 @@ def collect_stackexchange():
     dataset = load_dataset(
         "HuggingFaceH4/stack-exchange-preferences",
         split="train",
-        streaming=True
+        streaming=True,
+        cache_dir=os.environ.get("HF_DATASETS_CACHE")
     )
 
     output_file = os.path.join(RAW_DIR, "stackexchange_auto.jsonl")

@@ -1,5 +1,14 @@
 paths:
   # =========================
+  # CACHE (su questo disco/repo)
+  # =========================
+  cache_dir: ".cache/"
+  hf_home: ".cache/huggingface/"
+  datasets_cache_dir: ".cache/huggingface/datasets/"
+  transformers_cache_dir: ".cache/huggingface/transformers/"
+  torch_home: ".cache/torch/"
+
+  # =========================
   # DATA
   # =========================
   raw_data_dir: "data/raw/"

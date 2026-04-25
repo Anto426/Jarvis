@@ -3,12 +3,13 @@ from transformers import GPTNeoXForCausalLM
 from .architecture import load_model_config
 
 
-def initialize_model(device="cuda"):
+def initialize_model(device=None):
 
     config = load_model_config()
     model = GPTNeoXForCausalLM(config)
 
-    model.to(device)
+    if device:
+        model.to(device)
 
     model.config.use_cache = False
 

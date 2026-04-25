@@ -1,18 +1,19 @@
 import os
-import yaml
 import pyarrow.parquet as pq
 import pyarrow as pa
 from tqdm import tqdm
+from training.paths import get_path
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-SHARD_DIR = paths["shards_dir"]
+SHARD_DIR = get_path("shards_dir", create=True)
 BLOCK_SIZE = 2048
 
 def main():
 
     files = [os.path.join(SHARD_DIR, f) for f in os.listdir(SHARD_DIR) if f.endswith(".parquet")]
+    files = [f for f in files if not os.path.basename(f).startswith("packed_")]
+
+    if not files:
+        raise FileNotFoundError(f"Nessuno shard parquet non-packed trovato in {SHARD_DIR}")
 
     buffer = []
     packed_records = []

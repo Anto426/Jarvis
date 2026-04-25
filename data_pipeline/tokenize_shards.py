@@ -1,22 +1,19 @@
 import os
 import json
-import yaml
 import sentencepiece as spm
 from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
+from training.paths import get_path
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-DEDUP_DIR = os.path.join(paths["cleaned_data_dir"], "deduplicated")
-SHARD_DIR = paths["shards_dir"]
-TOKENIZER_DIR = paths["tokenizer_dir"]
+DEDUP_DIR = os.path.join(get_path("cleaned_data_dir", create=True), "deduplicated")
+SHARD_DIR = get_path("shards_dir", create=True)
+TOKENIZER_DIR = get_path("tokenizer_dir", create=True)
 
 os.makedirs(SHARD_DIR, exist_ok=True)
 
 sp = spm.SentencePieceProcessor()
-sp.load(os.path.join(TOKENIZER_DIR, "jarvis.model"))
+sp.load(os.path.join(str(TOKENIZER_DIR), "jarvis.model"))
 
 def main():
 

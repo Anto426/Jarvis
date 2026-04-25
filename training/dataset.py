@@ -1,19 +1,31 @@
 import os
+from training.paths import configure_cache_env, get_path
+
+
+configure_cache_env()
 from datasets import load_dataset
 
 def load_training_dataset(split_validation=False, val_ratio=0.02):
 
-    data_path = r"data\shards"
+    data_path = get_path("shards_dir", create=True)
+    data_pattern = os.path.join(str(data_path), "packed_*.parquet")
 
     print("CWD:", os.getcwd())
-    print("Looking for:", os.path.abspath(data_path))
-    print("Exists:", os.path.exists(data_path))
+    print("Looking for:", data_pattern)
+    print("Exists:", data_path.exists())
+
+    if not list(data_path.glob("packed_*.parquet")):
+        raise FileNotFoundError(
+            f"Nessuno shard packed trovato in {data_path}. "
+            "Esegui prima data_pipeline/pack_blocks.py."
+        )
 
     dataset = load_dataset(
         "parquet",
         data_files={
-            "train": os.path.join(data_path, "packed_*.parquet")
-        }
+            "train": data_pattern
+        },
+        cache_dir=os.environ.get("HF_DATASETS_CACHE"),
     )["train"]
 
     # ✅ SOLO input_ids

@@ -1,13 +1,9 @@
 import os
-import yaml
 import sentencepiece as spm
+from training.paths import get_path
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-DEDUP_DIR = os.path.join(paths["cleaned_data_dir"], "deduplicated")
-TOKENIZER_DIR = paths["tokenizer_dir"]
-os.makedirs(TOKENIZER_DIR, exist_ok=True)
+DEDUP_DIR = os.path.join(get_path("cleaned_data_dir", create=True), "deduplicated")
+TOKENIZER_DIR = get_path("tokenizer_dir", create=True)
 
 VOCAB_SIZE = 32000
 
@@ -17,11 +13,15 @@ def collect_files():
 
 def main():
 
-    input_files = ",".join(collect_files())
+    files = collect_files()
+    if not files:
+        raise FileNotFoundError(f"Nessun file deduplicato trovato in {DEDUP_DIR}")
+
+    input_files = ",".join(files)
 
     spm.SentencePieceTrainer.train(
         input=input_files,
-        model_prefix=os.path.join(TOKENIZER_DIR, "jarvis"),
+        model_prefix=os.path.join(str(TOKENIZER_DIR), "jarvis"),
         vocab_size=VOCAB_SIZE,
         model_type="unigram",
         character_coverage=0.9995,

@@ -3,16 +3,13 @@ import json
 import hashlib
 import multiprocessing as mp
 from tqdm import tqdm
-import yaml
+from training.paths import get_path
 
 # =========================
 # LOAD PATHS
 # =========================
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-CLEAN_DIR = paths["cleaned_data_dir"]
+CLEAN_DIR = get_path("cleaned_data_dir", create=True)
 DEDUP_DIR = os.path.join(CLEAN_DIR, "deduplicated")
 os.makedirs(DEDUP_DIR, exist_ok=True)
 

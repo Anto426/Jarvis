@@ -1,16 +1,16 @@
 import os
-import yaml
 import torch
 import sentencepiece as spm
 from safetensors.torch import load_file
 
 from models.init_model import initialize_model
+from training.paths import configure_cache_env, get_path
 
 
+configure_cache_env()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
+CHECKPOINT_DIR = get_path("model_output_dir", create=True)
 
 
 def get_latest_checkpoint(path):
@@ -47,14 +47,7 @@ model.to(DEVICE)
 model.eval()
 
 
-# --------------------------
-# 🔥 CARICA TOKENIZER
-# --------------------------
-
-with open(os.path.join(BASE_DIR, "config", "paths.yaml"), "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-tokenizer_path = os.path.join(paths["tokenizer_dir"], "jarvis.model")
+tokenizer_path = os.path.join(str(get_path("tokenizer_dir", create=True)), "jarvis.model")
 
 if not os.path.exists(tokenizer_path):
     raise FileNotFoundError(f"Tokenizer non trovato: {tokenizer_path}")

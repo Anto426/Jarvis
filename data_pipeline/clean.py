@@ -2,22 +2,17 @@ import os
 import json
 import re
 import unicodedata
-import yaml
 import multiprocessing as mp
 from tqdm import tqdm
 from langdetect import detect, LangDetectException
+from training.paths import get_path
 
 # =========================
 # LOAD PATHS
 # =========================
 
-with open("config/paths.yaml", "r") as f:
-    paths = yaml.safe_load(f)["paths"]
-
-RAW_DIR = paths["raw_data_dir"]
-CLEAN_DIR = paths["cleaned_data_dir"]
-
-os.makedirs(CLEAN_DIR, exist_ok=True)
+RAW_DIR = get_path("raw_data_dir", create=True)
+CLEAN_DIR = get_path("cleaned_data_dir", create=True)
 
 NUM_CORES = max(1, mp.cpu_count() - 1)
 
