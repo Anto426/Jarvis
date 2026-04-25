@@ -36,9 +36,19 @@ training:
   # =========================
   mixed_precision: "fp16"
   gradient_checkpointing: true
+  tf32: true
+  fused_optimizer: true
+  torch_compile: false
+  attention_implementation: "sdpa"
+  auto_batch_size: false
+  max_auto_batch_size: 8
+  target_vram_fraction: 0.92
 
   # =========================
   # DATA
   # =========================
   dataloader_num_workers: 4
   pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  drop_last: true

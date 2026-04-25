@@ -4,6 +4,7 @@ import yaml
 import time
 import torch
 import shutil
+import importlib.util
 from tqdm import tqdm
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -18,6 +19,157 @@ from training.paths import configure_cache_env, get_path
 
 SAVE_EVERY_MINUTES = 5
 SAVE_INTERVAL = SAVE_EVERY_MINUTES * 60
+INTERRUPT_REQUESTED = False
+
+
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_mixed_precision(config_value):
+    value = os.environ.get("JARVIS_MIXED_PRECISION", config_value)
+    if value == "bf16_if_available":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return "bf16"
+        return "fp16"
+    return value
+
+
+def override_from_env(train_cfg):
+    overrides = {
+        "JARVIS_BATCH_SIZE": "per_device_batch_size",
+        "JARVIS_GRAD_ACCUM": "gradient_accumulation_steps",
+        "JARVIS_DATALOADER_WORKERS": "dataloader_num_workers",
+        "JARVIS_MAX_STEPS": "max_steps",
+    }
+    for env_name, cfg_name in overrides.items():
+        value = os.environ.get(env_name)
+        if value:
+            train_cfg[cfg_name] = int(value)
+
+
+def configure_cuda_fast_path(train_cfg):
+    if not torch.cuda.is_available():
+        return
+
+    use_tf32 = env_flag("JARVIS_TF32", bool(train_cfg.get("tf32", True)))
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+    torch.backends.cudnn.benchmark = True
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend:
+        for name in ("enable_flash_sdp", "enable_mem_efficient_sdp", "enable_math_sdp"):
+            fn = getattr(cuda_backend, name, None)
+            if fn:
+                fn(True)
+
+
+def build_adamw(model, train_cfg, optimizer_kwargs):
+    return AdamW(
+        model.parameters(),
+        lr=float(train_cfg["learning_rate"]),
+        betas=tuple(train_cfg["betas"]),
+        eps=float(train_cfg["eps"]),
+        weight_decay=float(train_cfg["weight_decay"]),
+        **optimizer_kwargs,
+    )
+
+
+def get_autocast_dtype(mixed_precision):
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    if mixed_precision == "fp16":
+        return torch.float16
+    return None
+
+
+def triton_available():
+    return importlib.util.find_spec("triton") is not None
+
+
+def autotune_batch_size(model, train_cfg, mixed_precision):
+    if not env_flag("JARVIS_AUTO_BATCH", bool(train_cfg.get("auto_batch_size", False))):
+        return
+    if not torch.cuda.is_available():
+        return
+
+    device = torch.device("cuda")
+    model.to(device)
+    model.train()
+
+    start_batch = int(train_cfg["per_device_batch_size"])
+    max_batch = int(os.environ.get("JARVIS_MAX_BATCH_SIZE", train_cfg.get("max_auto_batch_size", 8)))
+    target_vram = float(os.environ.get("JARVIS_TARGET_VRAM", train_cfg.get("target_vram_fraction", 0.92)))
+    sequence_length = int(os.environ.get("JARVIS_TUNE_SEQUENCE_LENGTH", 2048))
+    vocab_size = int(getattr(model.config, "vocab_size", 32000))
+    dtype = get_autocast_dtype(mixed_precision)
+
+    original_effective_batch = start_batch * int(train_cfg["gradient_accumulation_steps"])
+    best_batch = start_batch
+    candidate = start_batch
+
+    print("")
+    print("CUDA autotune batch attivo")
+
+    while candidate <= max_batch:
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            model.zero_grad(set_to_none=True)
+
+            input_ids = torch.randint(
+                low=0,
+                high=vocab_size,
+                size=(candidate, sequence_length),
+                dtype=torch.long,
+                device=device,
+            )
+
+            if dtype is None:
+                output = model(input_ids=input_ids, labels=input_ids)
+            else:
+                with torch.autocast(device_type="cuda", dtype=dtype):
+                    output = model(input_ids=input_ids, labels=input_ids)
+
+            output.loss.backward()
+            torch.cuda.synchronize()
+
+            peak = torch.cuda.max_memory_reserved() / torch.cuda.get_device_properties(0).total_memory
+            print(f"  batch {candidate}: ok, peak VRAM {peak * 100:.1f}%")
+
+            best_batch = candidate
+            del input_ids, output
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+
+            if peak >= target_vram:
+                break
+
+            candidate *= 2
+        except torch.cuda.OutOfMemoryError:
+            print(f"  batch {candidate}: OOM, uso batch {best_batch}")
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            break
+
+    if best_batch != start_batch:
+        new_accumulation = max(1, math.ceil(original_effective_batch / best_batch))
+        train_cfg["per_device_batch_size"] = best_batch
+        train_cfg["gradient_accumulation_steps"] = new_accumulation
+        train_cfg["eval_batch_size"] = max(int(train_cfg.get("eval_batch_size", 1)), best_batch)
+        print(
+            "CUDA autotune scelto: "
+            f"micro_batch={best_batch}, grad_accum={new_accumulation}"
+        )
+    else:
+        print("CUDA autotune: tengo il batch configurato")
 
 
 def rotate_checkpoints(checkpoint_dir, max_checkpoints):
@@ -31,34 +183,78 @@ def rotate_checkpoints(checkpoint_dir, max_checkpoints):
         shutil.rmtree(old)
 
 
-def get_latest_checkpoint(checkpoint_dir):
+def cleanup_staging_checkpoints(checkpoint_dir):
     if not checkpoint_dir.exists():
-        return None
+        return
+    for staging in checkpoint_dir.glob("step_*.tmp"):
+        if staging.is_dir():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def get_latest_checkpoint(checkpoint_dir):
+    checkpoints = get_candidate_checkpoints(checkpoint_dir)
+    return checkpoints[0] if checkpoints else None
+
+
+def get_candidate_checkpoints(checkpoint_dir):
+    if not checkpoint_dir.exists():
+        return []
 
     checkpoints = [
         d for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.startswith("step_")
+        if d.is_dir() and d.name.startswith("step_") and not (d / ".bad_checkpoint").exists()
     ]
 
     if not checkpoints:
-        return None
+        return []
 
     checkpoints = sorted(
         checkpoints,
-        key=lambda x: int(x.name.split("_")[1])
+        key=lambda x: int(x.name.split("_")[1]),
+        reverse=True,
     )
 
-    return checkpoints[-1]
+    valid_checkpoints = []
+    for checkpoint in checkpoints:
+        has_model = (
+            (checkpoint / "pytorch_model.bin").exists()
+            or (checkpoint / "model.safetensors").exists()
+        )
+        has_training_state = (
+            (checkpoint / "optimizer.bin").exists()
+            and (checkpoint / "scheduler.bin").exists()
+        )
+
+        if has_model and has_training_state:
+            valid_checkpoints.append(checkpoint)
+            continue
+
+        print(f"Checkpoint incompleto ignorato: {checkpoint}")
+
+    return valid_checkpoints
 
 
 def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints):
     save_path = checkpoint_dir / f"step_{step}"
-    save_path.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_dir / f"step_{step}.tmp"
 
-    accelerator.save_state(str(save_path))
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path, ignore_errors=True)
+    if save_path.exists():
+        shutil.rmtree(save_path, ignore_errors=True)
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    accelerator.save_state(str(tmp_path), safe_serialization=False)
+    tmp_path.replace(save_path)
     rotate_checkpoints(checkpoint_dir, max_checkpoints)
 
-    accelerator.print(f"\n💾 Checkpoint salvato: {save_path}\n")
+    accelerator.print(f"\nCheckpoint salvato: {save_path}\n")
+
+
+def request_stop():
+    global INTERRUPT_REQUESTED
+    INTERRUPT_REQUESTED = True
 
 
 def main():
@@ -67,45 +263,97 @@ def main():
     with open("config/training.yaml", "r") as f:
         train_cfg = yaml.safe_load(f)["training"]
 
-    accelerator = Accelerator(mixed_precision=train_cfg["mixed_precision"])
+    override_from_env(train_cfg)
+    configure_cuda_fast_path(train_cfg)
+
+    mixed_precision = resolve_mixed_precision(train_cfg["mixed_precision"])
     checkpoint_dir = get_path("model_output_dir", create=True)
     max_checkpoints = int(train_cfg.get("save_total_limit", 2))
+    cleanup_staging_checkpoints(checkpoint_dir)
 
     dataset, val_dataset = load_training_dataset(split_validation=True)
 
-    model = initialize_model(device=None)
+    model = initialize_model(
+        device=None,
+        attn_implementation=train_cfg.get("attention_implementation"),
+    )
     if train_cfg["gradient_checkpointing"]:
         model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
-    accelerator.print(f"\n🚀 Model: {count_parameters(model)/1e6:.2f}M parameters\n")
+    autotune_batch_size(model, train_cfg, mixed_precision)
+
+    accumulation_steps = int(train_cfg["gradient_accumulation_steps"])
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=accumulation_steps,
+    )
+
+    fused_optimizer = env_flag(
+        "JARVIS_FUSED_OPTIMIZER",
+        bool(train_cfg.get("fused_optimizer", True)),
+    )
+    if fused_optimizer and torch.cuda.is_available():
+        model.to(accelerator.device)
+
+    compile_model = env_flag("JARVIS_TORCH_COMPILE", bool(train_cfg.get("torch_compile", False)))
+    if compile_model and hasattr(torch, "compile"):
+        if not triton_available() and not env_flag("JARVIS_FORCE_COMPILE", False):
+            accelerator.print(
+                "\ntorch.compile disattivato: Triton non disponibile su questo ambiente. "
+                "CUDA/BF16/TF32/fused optimizer restano attivi.\n"
+            )
+        else:
+            try:
+                torch_dynamo = importlib.import_module("torch._dynamo")
+
+                torch_dynamo.config.suppress_errors = True
+                accelerator.print("\ntorch.compile attivo (first step piu lento, poi piu veloce).\n")
+                model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+            except Exception as exc:
+                accelerator.print(f"\ntorch.compile disattivato: {exc}\n")
+
+    accelerator.print(f"\nModel: {count_parameters(model)/1e6:.2f}M parameters\n")
+
+    num_workers = int(train_cfg["dataloader_num_workers"])
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(train_cfg["pin_memory"]),
+        "drop_last": bool(train_cfg.get("drop_last", True)),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(train_cfg.get("persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(train_cfg.get("prefetch_factor", 4))
 
     train_loader = DataLoader(
         dataset,
         batch_size=train_cfg["per_device_batch_size"],
         shuffle=True,
-        num_workers=train_cfg["dataloader_num_workers"],
-        pin_memory=train_cfg["pin_memory"]
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_cfg["eval_batch_size"],
-        shuffle=False
+        shuffle=False,
+        num_workers=max(0, min(num_workers, 2)),
+        pin_memory=bool(train_cfg["pin_memory"]),
     )
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=float(train_cfg["learning_rate"]),
-        betas=tuple(train_cfg["betas"]),
-        eps=float(train_cfg["eps"]),
-        weight_decay=float(train_cfg["weight_decay"])
-    )
+    optimizer_kwargs = {}
+    if fused_optimizer and torch.cuda.is_available():
+        optimizer_kwargs["fused"] = True
 
-    total_steps = (
-        len(train_loader) //
-        train_cfg["gradient_accumulation_steps"]
-    ) * train_cfg["num_train_epochs"]
+    try:
+        optimizer = build_adamw(model, train_cfg, optimizer_kwargs)
+    except (TypeError, RuntimeError) as exc:
+        optimizer_kwargs.pop("fused", None)
+        accelerator.print(f"\nFused AdamW disattivato: {exc}\n")
+        optimizer = build_adamw(model, train_cfg, optimizer_kwargs)
+
+    total_steps = math.ceil(len(train_loader) / accumulation_steps) * train_cfg["num_train_epochs"]
+    if train_cfg.get("max_steps") is not None:
+        total_steps = min(total_steps, int(train_cfg["max_steps"]))
 
     scheduler = build_scheduler(
         optimizer,
@@ -117,17 +365,26 @@ def main():
         model, optimizer, train_loader, val_loader, scheduler
     )
 
-    # 🔥 AUTO RESUME
-    latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
     global_step = 0
 
-    if latest_checkpoint:
-        accelerator.print(f"\n🔄 Ripristino da {latest_checkpoint}\n")
-        accelerator.load_state(str(latest_checkpoint))
-        global_step = int(latest_checkpoint.name.split("_")[-1])
+    for checkpoint in get_candidate_checkpoints(checkpoint_dir):
+        accelerator.print(f"\nRipristino da {checkpoint}\n")
+        try:
+            accelerator.load_state(str(checkpoint))
+            global_step = int(checkpoint.name.split("_")[-1])
+            break
+        except Exception as exc:
+            accelerator.print(f"Checkpoint non caricabile, lo salto: {checkpoint}")
+            accelerator.print(f"Motivo: {exc}\n")
+            if accelerator.is_main_process:
+                marker = checkpoint / ".bad_checkpoint"
+                marker.write_text(str(exc), encoding="utf-8")
+    else:
+        accelerator.print("\nNessun checkpoint valido trovato: training da zero.\n")
 
-    accumulation_steps = train_cfg["gradient_accumulation_steps"]
     last_save_time = time.time()
+    max_steps = train_cfg.get("max_steps")
+    max_steps = int(max_steps) if max_steps is not None else None
 
     try:
 
@@ -141,100 +398,116 @@ def main():
             )
 
             for step, batch in enumerate(progress):
+                if INTERRUPT_REQUESTED:
+                    accelerator.print("\nStop richiesto: salvo checkpoint e chiudo.\n")
+                    return
 
-                with accelerator.autocast():
+                with accelerator.accumulate(model):
+                    with accelerator.autocast():
 
-                    outputs = model(
-                        input_ids=batch["input_ids"],
-                        labels=batch["input_ids"]
-                    )
-
-                    loss = outputs.loss / accumulation_steps
-
-                accelerator.backward(loss)
-
-                if (step + 1) % accumulation_steps == 0:
-
-                    accelerator.clip_grad_norm_(
-                        model.parameters(),
-                        train_cfg["max_grad_norm"]
-                    )
-
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-
-                    global_step += 1
-
-                    avg_loss = loss.item() * accumulation_steps
-                    perplexity = math.exp(min(avg_loss, 20))
-                    current_lr = scheduler.get_last_lr()[0]
-
-                    tokens = batch["input_ids"].numel()
-                    gpu_mem = (
-                        torch.cuda.memory_allocated() / 1024**3
-                        if torch.cuda.is_available() else 0
-                    )
-
-                    progress.set_description(
-                        f"E{epoch+1} | "
-                        f"GS {global_step}/{total_steps} | "
-                        f"Loss {avg_loss:.4f} | "
-                        f"PPL {perplexity:.1f} | "
-                        f"LR {current_lr:.2e} | "
-                        f"VRAM {gpu_mem:.1f}GB"
-                    )
-
-                    # 🔥 SAVE A TEMPO
-                    current_time = time.time()
-                    if current_time - last_save_time >= SAVE_INTERVAL:
-                        if accelerator.is_main_process:
-                            save_checkpoint(
-                                accelerator,
-                                global_step,
-                                checkpoint_dir,
-                                max_checkpoints
-                            )
-                        last_save_time = current_time
-
-                    # 🔥 VALIDATION
-                    if global_step % train_cfg["eval_steps"] == 0:
-
-                        model.eval()
-                        eval_loss = 0
-                        eval_steps = 0
-
-                        with torch.no_grad():
-                            for val_batch in val_loader:
-                                with accelerator.autocast():
-                                    val_out = model(
-                                        input_ids=val_batch["input_ids"],
-                                        labels=val_batch["input_ids"]
-                                    )
-                                eval_loss += val_out.loss.item()
-                                eval_steps += 1
-
-                        eval_loss /= eval_steps
-                        eval_ppl = math.exp(min(eval_loss, 20))
-
-                        accelerator.print(
-                            f"\n📊 Validation | "
-                            f"Loss {eval_loss:.4f} | "
-                            f"PPL {eval_ppl:.2f}\n"
+                        outputs = model(
+                            input_ids=batch["input_ids"],
+                            labels=batch["input_ids"]
                         )
 
-                        model.train()
+                        loss = outputs.loss
+
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+
+                        accelerator.clip_grad_norm_(
+                            model.parameters(),
+                            train_cfg["max_grad_norm"]
+                        )
+
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+
+                        global_step += 1
+
+                        avg_loss = loss.item()
+                        perplexity = math.exp(min(avg_loss, 20))
+                        current_lr = scheduler.get_last_lr()[0]
+
+                        tokens = batch["input_ids"].numel() * accumulation_steps
+                        gpu_mem = (
+                            torch.cuda.memory_allocated() / 1024**3
+                            if torch.cuda.is_available() else 0
+                        )
+
+                        progress.set_description(
+                            f"E{epoch+1} | "
+                            f"GS {global_step}/{total_steps} | "
+                            f"Loss {avg_loss:.4f} | "
+                            f"PPL {perplexity:.1f} | "
+                            f"LR {current_lr:.2e} | "
+                            f"Tok {tokens} | "
+                            f"VRAM {gpu_mem:.1f}GB"
+                        )
+
+                        # SAVE A TEMPO
+                        current_time = time.time()
+                        if current_time - last_save_time >= SAVE_INTERVAL:
+                            if accelerator.is_main_process:
+                                save_checkpoint(
+                                    accelerator,
+                                    global_step,
+                                    checkpoint_dir,
+                                    max_checkpoints
+                                )
+                            last_save_time = current_time
+
+                        # VALIDATION
+                        if global_step % train_cfg["eval_steps"] == 0:
+
+                            model.eval()
+                            eval_loss = 0
+                            eval_steps = 0
+
+                            with torch.no_grad():
+                                for val_batch in val_loader:
+                                    with accelerator.autocast():
+                                        val_out = model(
+                                            input_ids=val_batch["input_ids"],
+                                            labels=val_batch["input_ids"]
+                                        )
+                                    eval_loss += val_out.loss.item()
+                                    eval_steps += 1
+
+                            eval_loss /= eval_steps
+                            eval_ppl = math.exp(min(eval_loss, 20))
+
+                            accelerator.print(
+                                f"\nValidation | "
+                                f"Loss {eval_loss:.4f} | "
+                                f"PPL {eval_ppl:.2f}\n"
+                            )
+
+                            model.train()
+
+                        if max_steps and global_step >= max_steps:
+                            return
+
+    except KeyboardInterrupt:
+        request_stop()
+        accelerator.print("\nInterruzione ricevuta. Salvo checkpoint prima di uscire...\n")
 
     finally:
         if accelerator.is_main_process:
-            save_checkpoint(
-                accelerator,
-                global_step,
-                checkpoint_dir,
-                max_checkpoints
-            )
+            try:
+                save_checkpoint(
+                    accelerator,
+                    global_step,
+                    checkpoint_dir,
+                    max_checkpoints
+                )
+            except KeyboardInterrupt:
+                accelerator.print("\nUscita forzata durante il salvataggio. Checkpoint temporaneo ignorato.\n")
+                cleanup_staging_checkpoints(checkpoint_dir)
 
-    accelerator.print("\n🔥 Training completato.")
+    accelerator.print("\nTraining completato.")
 
 
 if __name__ == "__main__":

@@ -2,16 +2,11 @@ Write-Host "========================================"
 Write-Host "   HUGGING FACE LOGIN"
 Write-Host "========================================"
 
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Cache = Join-Path $Root ".cache"
-$Hf = Join-Path $Root ".venv\Scripts\hf.exe"
+. "$PSScriptRoot\lib\jarvis.ps1"
 
-$env:HF_HOME=(Join-Path $Cache "huggingface")
-$env:HF_DATASETS_CACHE=(Join-Path $Cache "huggingface\datasets")
-$env:TRANSFORMERS_CACHE=(Join-Path $Cache "huggingface\transformers")
-$env:HF_HUB_DISABLE_XET="1"
-
-New-Item -ItemType Directory -Force -Path $env:HF_HOME, $env:HF_DATASETS_CACHE, $env:TRANSFORMERS_CACHE | Out-Null
+$Root = Get-JarvisRoot
+Initialize-JarvisEnvironment -Root $Root
+$Hf = Get-JarvisHf -Root $Root
 
 if (-not (Test-Path $Hf)) {
     Write-Host "hf.exe non trovato. Esegui prima: powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1"

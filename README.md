@@ -35,7 +35,8 @@ The project is designed to keep heavy data, caches, tokenizer files, and checkpo
 - Wikimedia direct fallback when Hugging Face downloads are blocked
 - SentencePiece tokenizer build
 - Parquet shard packing for language-model pretraining
-- Accelerate-based fp16 training with checkpoint auto-resume
+- Accelerate-based BF16/FP16 training with checkpoint auto-resume
+- Smart launcher that skips data regeneration when packed shards are already valid
 
 <p align="center">
   <img src="./asset/divider.gif" width="440" height="40" />
@@ -65,22 +66,34 @@ From the repository root:
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1
 ```
 
-Run the full data pipeline and training:
+Run Jarvis. The launcher checks/configures the Python environment, builds the dataset only when needed, otherwise it resumes/trains directly:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_full_training.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1
 ```
 
-Run only pretraining when packed shards already exist:
+Update and check dependencies before running:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_pretraining.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -UpdateDeps
 ```
 
-Resume training from the latest checkpoint:
+Use CUDA turbo mode with `torch.compile`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\resume_training.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -Turbo
+```
+
+Use max performance mode. This enables CUDA compile plus automatic micro-batch tuning against available VRAM:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -MaxPerf
+```
+
+Start from zero and rebuild generated data:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -FromScratch -RebuildData
 ```
 
 <p align="center">
@@ -107,10 +120,18 @@ Supported local formats:
 - `.txt`: one document per file
 - `.jsonl`: one JSON object per line with a `text` field
 
-When Hugging Face is unreliable on the network, the pipeline uses Wikimedia direct downloads by default. Hugging Face can be re-enabled by setting:
+The smart launcher uses Hugging Face in `auto` mode by default: it runs a quick download preflight and skips Hub sources if the network resets.
+Hugging Face is used for modern data-only sources such as FineWeb2 Italian and StackExchange; Wikimedia direct remains the default Wikipedia source.
+To force direct/local-only sources:
 
 ```powershell
-$env:JARVIS_USE_HUGGINGFACE="1"
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -HuggingFace 0
+```
+
+The launcher stores a data fingerprint next to packed shards. If `data/local/`, `data_pipeline/`, or data path config changes, Jarvis rebuilds the generated dataset only when no checkpoint is being resumed or when you explicitly run from scratch. Existing checkpoints keep using the existing packed dataset until you choose:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -FromScratch -RebuildData
 ```
 
 <p align="center">
@@ -135,10 +156,12 @@ Training behavior is configured in `config/training.yaml`.
 
 Key defaults:
 
-- Precision: `fp16`
+- Precision: BF16 when supported, otherwise FP16
 - Batch size per device: `1`
 - Gradient accumulation: `16`
 - Gradient checkpointing: enabled
+- CUDA fast path: TF32, SDPA attention, fused optimizer
+- Max performance mode: `torch.compile` and automatic VRAM-based batch tuning
 - Checkpoint limit: `3`
 
 <p align="center">
@@ -171,7 +194,7 @@ The generated directories are intentionally ignored by Git.
 - `data_pipeline/`: collection, import, cleaning, deduplication, tokenizer build, tokenization, packing
 - `models/`: GPT-NeoX configuration and model initialization
 - `training/`: dataset loading, scheduler, training loop, checkpoint helpers
-- `scripts/`: PowerShell entrypoints for setup, full training, pretraining, resume, and Hugging Face login
+- `scripts/`: smart launcher, setup, checks, and Hugging Face login helpers
 - `asset/`: README visual assets
 
 <p align="center">
@@ -209,6 +232,12 @@ Check dependency consistency:
 .\.venv\Scripts\python.exe -m pip check
 ```
 
+Check Hugging Face connectivity:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_hf.ps1
+```
+
 Compile Python files:
 
 ```powershell
@@ -222,5 +251,8 @@ Compile Python files:
 ## Notes
 
 If Hugging Face fails with `WinError 10054`, it is usually a network reset during Hub downloads, not a Python error.
-The default full-training script disables Hugging Face and uses direct/local sources so the pipeline can continue.
+Use `-HuggingFace 0` to skip Hub sources and use direct/local sources.
+Use `-HuggingFace force` only when the network is known to handle Hub downloads reliably.
 
+On some Windows networks Python may prefer IPv6 for Hugging Face while IPv4 works correctly.
+Jarvis sets `JARVIS_FORCE_IPV4=1` in the PowerShell entrypoints, and `sitecustomize.py` forces Python networking to IPv4 for those runs.

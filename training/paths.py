@@ -35,7 +35,6 @@ def configure_cache_env():
     defaults = {
         "HF_HOME": paths.get("hf_home", str(cache_dir / "huggingface")),
         "HF_DATASETS_CACHE": paths.get("datasets_cache_dir", str(cache_dir / "huggingface" / "datasets")),
-        "TRANSFORMERS_CACHE": paths.get("transformers_cache_dir", str(cache_dir / "huggingface" / "transformers")),
         "TORCH_HOME": paths.get("torch_home", str(cache_dir / "torch")),
         "XDG_CACHE_HOME": str(cache_dir),
     }

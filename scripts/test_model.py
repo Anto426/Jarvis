@@ -20,7 +20,7 @@ def get_latest_checkpoint(path):
     ]
 
     if not checkpoints:
-        raise ValueError("❌ Nessun checkpoint trovato")
+        raise ValueError("Nessun checkpoint trovato")
 
     checkpoints = sorted(
         checkpoints,
@@ -31,16 +31,28 @@ def get_latest_checkpoint(path):
 
 
 # --------------------------
-# 🔥 CARICA CHECKPOINT
+# CARICA CHECKPOINT
 # --------------------------
 
-print("🔍 Cerco ultimo checkpoint...")
+print("Cerco ultimo checkpoint...")
 checkpoint_path = get_latest_checkpoint(CHECKPOINT_DIR)
-print(f"📦 Carico: {checkpoint_path}")
+print(f"Carico: {checkpoint_path}")
 
 model = initialize_model()
 
-state_dict = load_file(os.path.join(checkpoint_path, "model.safetensors"))
+safe_model_path = os.path.join(checkpoint_path, "model.safetensors")
+torch_model_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+
+if os.path.exists(safe_model_path):
+    state_dict = load_file(safe_model_path)
+elif os.path.exists(torch_model_path):
+    state_dict = torch.load(torch_model_path, map_location="cpu")
+else:
+    raise FileNotFoundError(
+        f"Nessun file modello trovato in {checkpoint_path}: "
+        "atteso model.safetensors o pytorch_model.bin"
+    )
+
 model.load_state_dict(state_dict, strict=False)
 
 model.to(DEVICE)
@@ -56,12 +68,12 @@ sp = spm.SentencePieceProcessor()
 sp.load(tokenizer_path)
 
 
-print(f"\n✅ Modello pronto su {DEVICE}")
-print("💬 Scrivi qualcosa (exit per uscire)\n")
+print(f"\nModello pronto su {DEVICE}")
+print("Scrivi qualcosa (exit per uscire)\n")
 
 
 # --------------------------
-# 🔥 GENERAZIONE
+# GENERAZIONE
 # --------------------------
 
 def generate(prompt, max_new_tokens=100):
@@ -86,17 +98,17 @@ def generate(prompt, max_new_tokens=100):
 
 
 # --------------------------
-# 🔥 LOOP INTERATTIVO
+# LOOP INTERATTIVO
 # --------------------------
 
 while True:
-    prompt = input("👤 > ")
+    prompt = input("> ")
 
     if prompt.lower() == "exit":
         break
 
     response = generate(prompt)
 
-    print("\n🤖 >")
+    print("\nJarvis >")
     print(response)
     print("-" * 60)

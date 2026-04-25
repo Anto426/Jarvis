@@ -3,9 +3,12 @@ from transformers import GPTNeoXForCausalLM
 from .architecture import load_model_config
 
 
-def initialize_model(device=None):
+def initialize_model(device=None, attn_implementation=None):
 
     config = load_model_config()
+    if attn_implementation:
+        config._attn_implementation = attn_implementation
+
     model = GPTNeoXForCausalLM(config)
 
     if device:

@@ -1,6 +1,7 @@
 # =========================
 # CORE LLM
 # =========================
+setuptools<82
 transformers==4.57.6
 accelerate==1.13.0
 datasets==4.8.4

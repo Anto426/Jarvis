@@ -2,26 +2,26 @@ Write-Host "========================================"
 Write-Host "   JARVIS ENV SETUP"
 Write-Host "========================================"
 
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+. "$PSScriptRoot\lib\jarvis.ps1"
+
+$Root = Get-JarvisRoot
 $Venv = Join-Path $Root ".venv"
-$Cache = Join-Path $Root ".cache"
 
-$env:PIP_CACHE_DIR=(Join-Path $Cache "pip")
-$env:HF_HOME=(Join-Path $Cache "huggingface")
-$env:HF_DATASETS_CACHE=(Join-Path $Cache "huggingface\datasets")
-$env:TRANSFORMERS_CACHE=(Join-Path $Cache "huggingface\transformers")
-$env:TORCH_HOME=(Join-Path $Cache "torch")
-$env:XDG_CACHE_HOME=$Cache
-$env:HF_HUB_DISABLE_XET="1"
-
-New-Item -ItemType Directory -Force -Path $env:PIP_CACHE_DIR, $env:HF_HOME, $env:HF_DATASETS_CACHE, $env:TRANSFORMERS_CACHE, $env:TORCH_HOME | Out-Null
+Initialize-JarvisEnvironment -Root $Root
 
 function Find-CompatiblePython {
     foreach ($Version in @("3.12", "3.11", "3.10")) {
         $Arg = "-$Version"
-        & py $Arg --version *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return $Arg
+        $PreviousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & py $Arg --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $Arg
+            }
+        }
+        finally {
+            $ErrorActionPreference = $PreviousErrorActionPreference
         }
     }
 
@@ -45,18 +45,35 @@ if (-not $PythonArg) {
 
 Push-Location $Root
 
-& py $PythonArg -m venv "$Venv"
-if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
-
 $Py = Join-Path $Venv "Scripts\python.exe"
 
-& $Py -m pip install --upgrade pip setuptools wheel
+if (-not (Test-Path $Py)) {
+    & py $PythonArg -m venv "$Venv"
+    if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+} else {
+    Write-Host "Venv esistente trovata: aggiorno dipendenze senza ricrearla."
+}
+
+& $Py -m pip install --upgrade pip wheel "setuptools<82"
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 
-& $Py -m pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+$TorchIndex = if ($env:JARVIS_TORCH_INDEX) { $env:JARVIS_TORCH_INDEX } else { "https://download.pytorch.org/whl/cu128" }
+Write-Host "Installo PyTorch CUDA da: $TorchIndex"
+
+& $Py -m pip install --upgrade torch --index-url $TorchIndex
+if ($LASTEXITCODE -ne 0 -and -not $env:JARVIS_TORCH_INDEX) {
+    Write-Host "CUDA 12.8 non disponibile per questa combinazione. Provo CUDA 12.6..."
+    & $Py -m pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu126
+}
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 
 & $Py -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+
+& $Py -m pip install "setuptools<82"
+if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+
+& $Py -m pip check
 $ExitCode = $LASTEXITCODE
 
 Pop-Location

@@ -4,11 +4,19 @@ from training.paths import get_path
 
 DEDUP_DIR = os.path.join(get_path("cleaned_data_dir", create=True), "deduplicated")
 TOKENIZER_DIR = get_path("tokenizer_dir", create=True)
+DEDUP_INCLUDE = [
+    name.strip()
+    for name in os.environ.get("JARVIS_DEDUP_INCLUDE", "").split(";")
+    if name.strip()
+]
 
 VOCAB_SIZE = 32000
 
 def collect_files():
-    files = [os.path.join(DEDUP_DIR, f) for f in os.listdir(DEDUP_DIR) if f.endswith(".jsonl")]
+    files = [f for f in os.listdir(DEDUP_DIR) if f.endswith(".jsonl")]
+    if DEDUP_INCLUDE:
+        files = [f for f in files if f in DEDUP_INCLUDE]
+    files = [os.path.join(DEDUP_DIR, f) for f in files]
     return files
 
 def main():

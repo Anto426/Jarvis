@@ -20,9 +20,49 @@ CACHE_DIR = get_path("cache_dir", create=True)
 # CONFIG
 # =========================
 
-USE_HUGGINGFACE = os.environ.get("JARVIS_USE_HUGGINGFACE", "0") == "1"
-USE_WIKIPEDIA = USE_HUGGINGFACE
-USE_MC4 = USE_HUGGINGFACE
+HUGGINGFACE_MODE = os.environ.get("JARVIS_USE_HUGGINGFACE", "auto").lower()
+HF_PREFLIGHT_URL = (
+    "https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/"
+    "20231101.it/train-00000-of-00010.parquet"
+)
+HF_PREFLIGHT_BYTES = 16 * 1024 * 1024
+
+
+def huggingface_preflight():
+    if HUGGINGFACE_MODE in {"0", "false", "no", "off"}:
+        return False
+
+    if HUGGINGFACE_MODE in {"force", "forced"}:
+        return True
+
+    import requests
+
+    print("Controllo rapido Hugging Face...")
+    try:
+        with requests.get(
+            HF_PREFLIGHT_URL,
+            stream=True,
+            timeout=30,
+        ) as response:
+            response.raise_for_status()
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded >= HF_PREFLIGHT_BYTES:
+                    break
+    except Exception as exc:
+        print(f"Hugging Face non stabile ({type(exc).__name__}: {exc}). Lo salto per questa run.")
+        return False
+
+    print("Hugging Face disponibile.")
+    return True
+
+
+USE_HUGGINGFACE = huggingface_preflight()
+USE_WIKIPEDIA = os.environ.get("JARVIS_USE_HF_WIKIPEDIA", "0") == "1" and USE_HUGGINGFACE
+USE_FINEWEB = USE_HUGGINGFACE
 USE_STACKEXCHANGE = USE_HUGGINGFACE
 USE_WIKIMEDIA_DIRECT = True
 
@@ -30,12 +70,12 @@ WIKIPEDIA_SOURCES = [
     ("wikimedia/wikipedia", "20231101.it"),
     ("OpenLLM-France/wikipedia", "it"),
 ]
-MC4_SOURCES = [
-    ("mc4", "it"),
-    ("bertin-project/mc4-sampling", "it"),
+FINEWEB_SOURCES = [
+    ("HuggingFaceFW/fineweb-2", "ita_Latn"),
 ]
 
-MC4_LIMIT = 500_000
+WIKIPEDIA_LIMIT = 100_000
+FINEWEB_LIMIT = 200_000
 STACK_LIMIT = 300_000
 WIKIMEDIA_DIRECT_LIMIT = 100_000
 WIKIMEDIA_ARTICLES_URL = (
@@ -245,7 +285,8 @@ def collect_wikipedia():
     saved = save_jsonl(
         dataset,
         output_file,
-        text_extractor=lambda x: x.get("text", "")
+        text_extractor=lambda x: x.get("text", ""),
+        limit=WIKIPEDIA_LIMIT
     )
 
     print(f"Wikipedia salvata: {saved} record.")
@@ -253,29 +294,29 @@ def collect_wikipedia():
 
 
 # =========================
-# MC4
+# FINEWEB
 # =========================
 
-def collect_mc4():
+def collect_fineweb():
 
-    print("Scarico MC4 IT...")
+    print("Scarico FineWeb2 IT...")
 
     dataset = load_first_available(
-        "MC4 IT",
-        MC4_SOURCES,
+        "FineWeb2 IT",
+        FINEWEB_SOURCES,
         split="train"
     )
 
-    output_file = os.path.join(RAW_DIR, "mc4_it.jsonl")
+    output_file = os.path.join(RAW_DIR, "fineweb2_it.jsonl")
 
     saved = save_jsonl(
         dataset,
         output_file,
         text_extractor=lambda x: x.get("text", ""),
-        limit=MC4_LIMIT
+        limit=FINEWEB_LIMIT
     )
 
-    print(f"MC4 salvato: {saved} record.")
+    print(f"FineWeb2 salvato: {saved} record.")
     return saved
 
 
@@ -309,7 +350,10 @@ def collect_stackexchange():
     def extract_text(sample):
 
         question = sample.get("question", "")
-        response = sample.get("response", "")
+        answers = sample.get("answers", [])
+        response = ""
+        if answers:
+            response = answers[0].get("text") or answers[0].get("body") or answers[0].get("answer", "")
 
         text = question + "\n" + response
         text_lower = text.lower()
@@ -344,13 +388,13 @@ def main():
     if USE_WIKIPEDIA:
         total_saved += run_source("Wikipedia IT", collect_wikipedia)
 
-    if USE_MC4:
-        total_saved += run_source("MC4 IT", collect_mc4)
+    if USE_FINEWEB:
+        total_saved += run_source("FineWeb2 IT", collect_fineweb)
 
     if USE_STACKEXCHANGE:
         total_saved += run_source("StackExchange", collect_stackexchange)
 
-    if total_saved == 0 and USE_WIKIMEDIA_DIRECT:
+    if USE_WIKIMEDIA_DIRECT:
         total_saved += run_source("Wikimedia direct", collect_wikimedia_direct)
 
     if total_saved == 0 and not existing_raw_files:

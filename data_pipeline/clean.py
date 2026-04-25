@@ -15,6 +15,11 @@ RAW_DIR = get_path("raw_data_dir", create=True)
 CLEAN_DIR = get_path("cleaned_data_dir", create=True)
 
 NUM_CORES = max(1, mp.cpu_count() - 1)
+RAW_INCLUDE = [
+    name.strip()
+    for name in os.environ.get("JARVIS_RAW_INCLUDE", "").split(";")
+    if name.strip()
+]
 
 # =========================
 # QUALITY THRESHOLDS
@@ -78,18 +83,19 @@ def process_line(line):
 # =========================
 
 def clean_file(input_path, output_path):
+    saved = 0
 
-    with open(input_path, "r", encoding="utf-8") as fin:
-        lines = fin.readlines()
+    with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
+        with mp.Pool(NUM_CORES) as pool:
+            for result in tqdm(pool.imap_unordered(process_line, fin, chunksize=1000)):
+                if not result:
+                    continue
 
-    with mp.Pool(NUM_CORES) as pool:
-        results = list(tqdm(pool.imap_unordered(process_line, lines), total=len(lines)))
-
-    with open(output_path, "w", encoding="utf-8") as fout:
-        for result in results:
-            if result:
                 json.dump(result, fout, ensure_ascii=False)
                 fout.write("\n")
+                saved += 1
+
+    print(f"Salvati {saved} record puliti in {output_path}")
 
 # =========================
 # MAIN
@@ -98,6 +104,8 @@ def clean_file(input_path, output_path):
 def main():
 
     files = [f for f in os.listdir(RAW_DIR) if f.endswith(".jsonl")]
+    if RAW_INCLUDE:
+        files = [f for f in files if f in RAW_INCLUDE]
 
     if not files:
         print("Nessun file raw trovato.")
