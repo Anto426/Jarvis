@@ -12,6 +12,7 @@ paths:
   # DATA
   # =========================
   raw_data_dir: "data/raw/"
+  local_data_dir: "data/local/"
   cleaned_data_dir: "data/cleaned/"
   shards_dir: "data/shards/"
   tokenizer_dir: "data/tokenizer/"

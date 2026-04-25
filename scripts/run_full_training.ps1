@@ -11,6 +11,9 @@ $env:HF_DATASETS_CACHE=(Join-Path $Cache "huggingface\datasets")
 $env:TRANSFORMERS_CACHE=(Join-Path $Cache "huggingface\transformers")
 $env:TORCH_HOME=(Join-Path $Cache "torch")
 $env:XDG_CACHE_HOME=$Cache
+$env:PYTHONPATH=$Root
+$env:HF_HUB_DISABLE_XET="1"
+$env:JARVIS_USE_HUGGINGFACE="0"
 
 New-Item -ItemType Directory -Force -Path $env:HF_HOME, $env:HF_DATASETS_CACHE, $env:TRANSFORMERS_CACHE, $env:TORCH_HOME | Out-Null
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
@@ -19,6 +22,9 @@ if (-not (Test-Path $Python)) { $Python = "python" }
 if (-not (Test-Path $Accelerate)) { $Accelerate = "accelerate" }
 
 Push-Location $Root
+
+& $Python data_pipeline/import_local.py
+if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 
 & $Python data_pipeline/collect.py
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }

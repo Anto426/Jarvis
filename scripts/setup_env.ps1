@@ -12,6 +12,7 @@ $env:HF_DATASETS_CACHE=(Join-Path $Cache "huggingface\datasets")
 $env:TRANSFORMERS_CACHE=(Join-Path $Cache "huggingface\transformers")
 $env:TORCH_HOME=(Join-Path $Cache "torch")
 $env:XDG_CACHE_HOME=$Cache
+$env:HF_HUB_DISABLE_XET="1"
 
 New-Item -ItemType Directory -Force -Path $env:PIP_CACHE_DIR, $env:HF_HOME, $env:HF_DATASETS_CACHE, $env:TRANSFORMERS_CACHE, $env:TORCH_HOME | Out-Null
 
