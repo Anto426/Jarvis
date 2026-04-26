@@ -192,8 +192,10 @@ function Clear-GeneratedData {
 }
 
 function Clear-Checkpoints {
-    Write-Host "Pulisco checkpoint per ripartenza da zero"
+    Write-Host "Pulisco checkpoint e log di training per ripartenza da zero"
     Remove-GeneratedPath $CheckpointDir
+    $LogsDir = Join-Path $Root "logs"
+    Remove-GeneratedPath $LogsDir
 }
 
 function Invoke-DataPipeline {

@@ -35,9 +35,47 @@ MAX_DIGIT_RATIO = 0.2
 
 def basic_clean(text):
     text = unicodedata.normalize("NFC", text)
+    
+    # 3. Sezioni di Servizio: Tronca il testo all'inizio di queste sezioni
+    service_keywords = [
+        "Note", "Bibliografia", "Voci correlate", "Altri progetti", "Collegamenti esterni"
+    ]
+    section_pattern = re.compile(
+        r'(?:\n|^)(?:==+ *|)(?:' + '|'.join(service_keywords) + r')(?: *==+|\n|:)', 
+        flags=re.IGNORECASE
+    )
+    match = section_pattern.search(text)
+    if match:
+        text = text[:match.start()]
+        
+    # 1. Firme e Timestamp
+    text = re.sub(r'--[^\n]*?(?:\d{1,2}:\d{2}|\d{1,2}\s+[a-zA-Z]+\s+\d{4})[^\n]*', ' ', text)
+    
+    # 2. Codice Wiki e Template
+    # Template {{...}} (gestisce fino a 2 livelli di annidamento)
+    text = re.sub(r'\{\{(?:[^{}]|\{[^{}]*\})*\}\}', ' ', text)
+    text = re.sub(r'\{\{.*?\}\}', ' ', text) # Fallback
+    
+    # Link interni: [[Target|Testo]] -> Testo, [[Testo]] -> Testo
+    text = re.sub(r'\[\[(?:[^\]\|\n]*\|)?([^\]\|\n]+)\]\]', r'\1', text)
+    text = re.sub(r'\[\[.*?\]\]', ' ', text) # Rimanenti non validi
+    
+    # Simboli ripetuti
+    text = re.sub(r'\^{2,}', ' ', text)
+    text = re.sub(r'-{3,}', ' ', text)
+    
+    # 4. Identificativi di Sistema
     text = re.sub(r"<.*?>", " ", text)
     text = re.sub(r"http\S+", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    # Stringhe alfanumeriche isolate (es. hash, ID revisione di almeno 8 caratteri)
+    text = re.sub(r'\b(?=[A-Za-z0-9]*\d)(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}\b', ' ', text)
+    
+    # 5. Regole di Formattazione
+    # Rimuovi spazi multipli ma preserva i newline per i paragrafi
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = '\n'.join(line.strip() for line in text.split('\n'))
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
     return text.strip()
 
 def is_valid_text(text):
