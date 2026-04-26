@@ -1,4 +1,17 @@
 import os
+import sys
+import subprocess
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+
+if VENV_PYTHON.exists() and Path(sys.executable).resolve() != VENV_PYTHON.resolve():
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), *sys.argv])
+
+sys.path.insert(0, str(ROOT))
+
 import torch
 import sentencepiece as spm
 from safetensors.torch import load_file

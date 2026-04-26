@@ -30,6 +30,7 @@ training:
   eval_steps: 1000
   save_steps: 1000
   save_total_limit: 3
+  status_update_seconds: 5
 
   # =========================
   # PRECISION
@@ -41,7 +42,8 @@ training:
   torch_compile: false
   attention_implementation: "sdpa"
   auto_batch_size: false
-  max_auto_batch_size: 8
+  max_auto_batch_size: 4
+  auto_batch_repeats: 2
   target_vram_fraction: 0.92
 
   # =========================

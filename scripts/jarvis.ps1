@@ -3,6 +3,9 @@ param(
     [switch]$RebuildData,
     [switch]$Turbo,
     [switch]$MaxPerf,
+    [switch]$FlashAttention,
+    [switch]$InstallFlashAttention,
+    [switch]$ForceExperimentalFlashAttentionInstall,
     [switch]$UpdateDeps,
     [switch]$SkipDependencyCheck,
     [switch]$SkipTraining,
@@ -45,7 +48,13 @@ if ($Turbo -or $MaxPerf) {
 if ($MaxPerf) {
     $env:JARVIS_AUTO_BATCH = "1"
     $env:JARVIS_TARGET_VRAM = "0.92"
-    $env:JARVIS_MAX_BATCH_SIZE = "8"
+    $env:JARVIS_MAX_BATCH_SIZE = "4"
+    $env:JARVIS_TUNE_REPEATS = "2"
+}
+
+if ($FlashAttention -or $MaxPerf) {
+    $env:JARVIS_USE_FLASH_ATTENTION = "1"
+    $env:JARVIS_ATTENTION_IMPL = "auto"
 }
 
 if (-not $SkipDependencyCheck) {
@@ -56,6 +65,18 @@ if (-not $SkipDependencyCheck) {
 }
 
 $Python = Get-JarvisPython -Root $Root
+
+if ($InstallFlashAttention) {
+    if (-not (Install-JarvisFlashAttention -Root $Root -AllowExperimentalWindows:$ForceExperimentalFlashAttentionInstall)) {
+        Write-Host "Install FlashAttention fallita o non supportata su questo ambiente."
+        Write-Host "Percorso consigliato per FlashAttention stabile: WSL2/Ubuntu o Linux nativo."
+    }
+}
+
+if (($FlashAttention -or $MaxPerf) -and -not (Test-JarvisPythonModule -Root $Root -ModuleName "flash_attn")) {
+    Write-Host "FlashAttention richiesta, ma flash_attn non e installato/importabile: usero SDPA."
+    Write-Host "Per tentare install ufficiale: powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -InstallFlashAttention -FlashAttention"
+}
 
 function Get-RelativePath {
     param([string]$Path)

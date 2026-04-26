@@ -29,6 +29,30 @@ def env_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def format_duration(seconds):
+    if seconds is None or seconds <= 0 or math.isinf(seconds):
+        return "--"
+
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def cuda_memory_gb():
+    if not torch.cuda.is_available():
+        return 0.0, 0.0
+
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    return allocated, reserved
+
+
 def resolve_mixed_precision(config_value):
     value = os.environ.get("JARVIS_MIXED_PRECISION", config_value)
     if value == "bf16_if_available":
@@ -94,6 +118,30 @@ def triton_available():
     return importlib.util.find_spec("triton") is not None
 
 
+def flash_attention_available():
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def resolve_attention_implementation(train_cfg):
+    requested = os.environ.get(
+        "JARVIS_ATTENTION_IMPL",
+        train_cfg.get("attention_implementation", "sdpa"),
+    )
+
+    if requested == "auto":
+        if env_flag("JARVIS_USE_FLASH_ATTENTION", False) and flash_attention_available():
+            return "flash_attention_2"
+        return "sdpa"
+
+    if requested == "flash_attention_2" and not flash_attention_available():
+        if env_flag("JARVIS_REQUIRE_FLASH_ATTENTION", False):
+            raise RuntimeError("FlashAttention richiesta ma flash_attn non e installato/importabile.")
+        print("FlashAttention non disponibile: fallback a SDPA.")
+        return "sdpa"
+
+    return requested
+
+
 def autotune_batch_size(model, train_cfg, mixed_precision):
     if not env_flag("JARVIS_AUTO_BATCH", bool(train_cfg.get("auto_batch_size", False))):
         return
@@ -108,17 +156,21 @@ def autotune_batch_size(model, train_cfg, mixed_precision):
     max_batch = int(os.environ.get("JARVIS_MAX_BATCH_SIZE", train_cfg.get("max_auto_batch_size", 8)))
     target_vram = float(os.environ.get("JARVIS_TARGET_VRAM", train_cfg.get("target_vram_fraction", 0.92)))
     sequence_length = int(os.environ.get("JARVIS_TUNE_SEQUENCE_LENGTH", 2048))
+    repeats = int(os.environ.get("JARVIS_TUNE_REPEATS", train_cfg.get("auto_batch_repeats", 2)))
     vocab_size = int(getattr(model.config, "vocab_size", 32000))
     dtype = get_autocast_dtype(mixed_precision)
 
     original_effective_batch = start_batch * int(train_cfg["gradient_accumulation_steps"])
     best_batch = start_batch
+    best_tokens_per_second = 0.0
     candidate = start_batch
 
     print("")
     print("CUDA autotune batch attivo")
 
     while candidate <= max_batch:
+        input_ids = None
+        output = None
         try:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -132,21 +184,44 @@ def autotune_batch_size(model, train_cfg, mixed_precision):
                 device=device,
             )
 
+            # Warmup non cronometrato: evita di scegliere batch grandi solo per effetto cache/JIT.
             if dtype is None:
                 output = model(input_ids=input_ids, labels=input_ids)
             else:
                 with torch.autocast(device_type="cuda", dtype=dtype):
                     output = model(input_ids=input_ids, labels=input_ids)
-
             output.loss.backward()
             torch.cuda.synchronize()
+            model.zero_grad(set_to_none=True)
+            del output
+
+            elapsed = 0.0
+            for _ in range(repeats):
+                started_at = time.time()
+                if dtype is None:
+                    output = model(input_ids=input_ids, labels=input_ids)
+                else:
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        output = model(input_ids=input_ids, labels=input_ids)
+
+                output.loss.backward()
+                torch.cuda.synchronize()
+                elapsed += time.time() - started_at
+                model.zero_grad(set_to_none=True)
+                del output
 
             peak = torch.cuda.max_memory_reserved() / torch.cuda.get_device_properties(0).total_memory
-            print(f"  batch {candidate}: ok, peak VRAM {peak * 100:.1f}%")
+            tokens_per_second = (candidate * sequence_length * repeats) / max(elapsed, 1e-6)
+            print(
+                f"  batch {candidate}: ok, "
+                f"{tokens_per_second:.0f} tok/s, peak VRAM {peak * 100:.1f}%"
+            )
 
-            best_batch = candidate
-            del input_ids, output
-            model.zero_grad(set_to_none=True)
+            if tokens_per_second > best_tokens_per_second:
+                best_tokens_per_second = tokens_per_second
+                best_batch = candidate
+
+            del input_ids
             torch.cuda.empty_cache()
 
             if peak >= target_vram:
@@ -156,6 +231,10 @@ def autotune_batch_size(model, train_cfg, mixed_precision):
         except torch.cuda.OutOfMemoryError:
             print(f"  batch {candidate}: OOM, uso batch {best_batch}")
             model.zero_grad(set_to_none=True)
+            if input_ids is not None:
+                del input_ids
+            if output is not None:
+                del output
             torch.cuda.empty_cache()
             break
 
@@ -166,7 +245,8 @@ def autotune_batch_size(model, train_cfg, mixed_precision):
         train_cfg["eval_batch_size"] = max(int(train_cfg.get("eval_batch_size", 1)), best_batch)
         print(
             "CUDA autotune scelto: "
-            f"micro_batch={best_batch}, grad_accum={new_accumulation}"
+            f"micro_batch={best_batch}, grad_accum={new_accumulation}, "
+            f"stima={best_tokens_per_second:.0f} tok/s"
         )
     else:
         print("CUDA autotune: tengo il batch configurato")
@@ -272,10 +352,11 @@ def main():
     cleanup_staging_checkpoints(checkpoint_dir)
 
     dataset, val_dataset = load_training_dataset(split_validation=True)
+    attention_impl = resolve_attention_implementation(train_cfg)
 
     model = initialize_model(
         device=None,
-        attn_implementation=train_cfg.get("attention_implementation"),
+        attn_implementation=attention_impl,
     )
     if train_cfg["gradient_checkpointing"]:
         model.gradient_checkpointing_enable()
@@ -313,7 +394,10 @@ def main():
             except Exception as exc:
                 accelerator.print(f"\ntorch.compile disattivato: {exc}\n")
 
-    accelerator.print(f"\nModel: {count_parameters(model)/1e6:.2f}M parameters\n")
+    accelerator.print(
+        f"\nModel: {count_parameters(model)/1e6:.2f}M parameters | "
+        f"attention={attention_impl}\n"
+    )
 
     num_workers = int(train_cfg["dataloader_num_workers"])
     loader_kwargs = {
@@ -383,6 +467,19 @@ def main():
         accelerator.print("\nNessun checkpoint valido trovato: training da zero.\n")
 
     last_save_time = time.time()
+    status_start_time = last_save_time
+    last_status_time = last_save_time
+    last_status_tokens = 0
+    last_status_micro_steps = 0
+    session_tokens = 0
+    session_micro_steps = 0
+    session_start_global_step = global_step
+    last_loss = None
+    last_ppl = None
+    last_lr = scheduler.get_last_lr()[0]
+    status_update_seconds = float(
+        os.environ.get("JARVIS_STATUS_SECONDS", train_cfg.get("status_update_seconds", 5))
+    )
     max_steps = train_cfg.get("max_steps")
     max_steps = int(max_steps) if max_steps is not None else None
 
@@ -413,6 +510,47 @@ def main():
                         loss = outputs.loss
 
                     accelerator.backward(loss)
+                    batch_tokens = batch["input_ids"].numel()
+                    session_tokens += batch_tokens
+                    session_micro_steps += 1
+                    current_time = time.time()
+
+                    if (
+                        current_time - last_status_time >= status_update_seconds
+                        or accelerator.sync_gradients
+                    ):
+                        last_loss = loss.detach().float().item()
+                        last_ppl = math.exp(min(last_loss, 20))
+                        elapsed_window = max(current_time - last_status_time, 1e-6)
+                        total_elapsed = max(current_time - status_start_time, 1e-6)
+                        window_tokens = session_tokens - last_status_tokens
+                        window_micro_steps = session_micro_steps - last_status_micro_steps
+                        tokens_per_second = window_tokens / elapsed_window
+                        micro_steps_per_second = window_micro_steps / elapsed_window
+                        completed_global_steps = max(0, global_step - session_start_global_step)
+                        global_steps_per_second = completed_global_steps / total_elapsed
+                        eta_seconds = (
+                            (total_steps - global_step) / global_steps_per_second
+                            if global_steps_per_second > 0 else None
+                        )
+                        allocated_gb, reserved_gb = cuda_memory_gb()
+
+                        progress.set_description(
+                            f"E{epoch+1} | "
+                            f"GS {global_step}/{total_steps} | "
+                            f"Loss {last_loss:.4f} | "
+                            f"PPL {last_ppl:.1f} | "
+                            f"LR {last_lr:.2e} | "
+                            f"{tokens_per_second:.0f} tok/s | "
+                            f"{micro_steps_per_second:.2f} it/s | "
+                            f"ETA {format_duration(eta_seconds)} | "
+                            f"VRAM {allocated_gb:.1f}/{reserved_gb:.1f}GB",
+                            refresh=True,
+                        )
+
+                        last_status_time = current_time
+                        last_status_tokens = session_tokens
+                        last_status_micro_steps = session_micro_steps
 
                     if accelerator.sync_gradients:
 
@@ -430,12 +568,10 @@ def main():
                         avg_loss = loss.item()
                         perplexity = math.exp(min(avg_loss, 20))
                         current_lr = scheduler.get_last_lr()[0]
+                        last_lr = current_lr
 
                         tokens = batch["input_ids"].numel() * accumulation_steps
-                        gpu_mem = (
-                            torch.cuda.memory_allocated() / 1024**3
-                            if torch.cuda.is_available() else 0
-                        )
+                        allocated_gb, reserved_gb = cuda_memory_gb()
 
                         progress.set_description(
                             f"E{epoch+1} | "
@@ -444,7 +580,8 @@ def main():
                             f"PPL {perplexity:.1f} | "
                             f"LR {current_lr:.2e} | "
                             f"Tok {tokens} | "
-                            f"VRAM {gpu_mem:.1f}GB"
+                            f"VRAM {allocated_gb:.1f}/{reserved_gb:.1f}GB",
+                            refresh=True,
                         )
 
                         # SAVE A TEMPO

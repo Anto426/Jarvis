@@ -90,6 +90,24 @@ Use max performance mode. This enables CUDA compile plus automatic micro-batch t
 powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -MaxPerf
 ```
 
+Request FlashAttention 2 when `flash_attn` is installed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -FlashAttention
+```
+
+Attempt the official `flash-attn` install in the current environment:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -InstallFlashAttention -FlashAttention
+```
+
+For the stable FlashAttention path, use WSL2/Ubuntu or Linux and run:
+
+```bash
+bash scripts/setup_flash_attention_wsl.sh
+```
+
 Start from zero and rebuild generated data:
 
 ```powershell
