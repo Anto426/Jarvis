@@ -3,8 +3,10 @@ import math
 import yaml
 import time
 import torch
+import json
 import shutil
 import importlib.util
+from datetime import datetime, timezone
 from tqdm import tqdm
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -51,6 +53,92 @@ def cuda_memory_gb():
     allocated = torch.cuda.memory_allocated() / 1024**3
     reserved = torch.cuda.memory_reserved() / 1024**3
     return allocated, reserved
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def write_json_atomic(path, payload):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def init_metrics(logs_dir, train_cfg, total_steps, start_global_step):
+    metrics_path = logs_dir / "training_metrics.json"
+    previous = {}
+    if metrics_path.exists():
+        try:
+            with metrics_path.open("r", encoding="utf-8") as f:
+                previous = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+
+    timestamp = utc_now_iso()
+    history = previous.get("history", [])
+    epochs = previous.get("epochs", [])
+    if not isinstance(history, list):
+        history = []
+    if not isinstance(epochs, list):
+        epochs = []
+
+    current = previous.get("current", {})
+    if not isinstance(current, dict):
+        current = {}
+    current = {
+        **current,
+        "type": current.get("type", "resume"),
+        "timestamp": timestamp,
+        "global_step": start_global_step,
+        "total_steps": total_steps,
+    }
+
+    metrics = {
+        "schema_version": 1,
+        "created_at": previous.get("created_at", timestamp),
+        "updated_at": timestamp,
+        "status": "running",
+        "total_steps": total_steps,
+        "start_global_step": start_global_step,
+        "current": current,
+        "config": {
+            "num_train_epochs": int(train_cfg["num_train_epochs"]),
+            "per_device_batch_size": int(train_cfg["per_device_batch_size"]),
+            "gradient_accumulation_steps": int(train_cfg["gradient_accumulation_steps"]),
+            "learning_rate": float(train_cfg["learning_rate"]),
+            "eval_steps": int(train_cfg["eval_steps"]),
+            "logging_steps": int(train_cfg.get("logging_steps", 50)),
+            "max_steps": train_cfg.get("max_steps"),
+        },
+        "history": history,
+        "epochs": epochs,
+    }
+    write_json_atomic(metrics_path, metrics)
+    return metrics_path, metrics
+
+
+def record_metric(metrics_path, metrics, kind, values):
+    entry = {"type": kind, "timestamp": utc_now_iso(), **values}
+    metrics["updated_at"] = entry["timestamp"]
+    metrics["current"] = entry
+    metrics["history"].append(entry)
+    write_json_atomic(metrics_path, metrics)
+
+
+def record_epoch_metrics(metrics_path, metrics, values):
+    entry = {"timestamp": utc_now_iso(), **values}
+    metrics["updated_at"] = entry["timestamp"]
+    metrics["epochs"].append(entry)
+    write_json_atomic(metrics_path, metrics)
+
+
+def update_metrics_status(metrics_path, metrics, status, global_step):
+    metrics["updated_at"] = utc_now_iso()
+    metrics["status"] = status
+    metrics["current"] = {**metrics.get("current", {}), "global_step": global_step}
+    write_json_atomic(metrics_path, metrics)
 
 
 def resolve_mixed_precision(config_value):
@@ -482,12 +570,25 @@ def main():
     )
     max_steps = train_cfg.get("max_steps")
     max_steps = int(max_steps) if max_steps is not None else None
+    logging_steps = max(1, int(train_cfg.get("logging_steps", 50)))
+
+    logs_dir = get_path("logs_dir", create=True)
+    metrics_path = None
+    metrics = None
+    if accelerator.is_main_process:
+        metrics_path, metrics = init_metrics(logs_dir, train_cfg, total_steps, global_step)
+        accelerator.print(f"\nMetriche training: {metrics_path}\n")
+    metrics_final_status = "completed"
 
     try:
 
         for epoch in range(train_cfg["num_train_epochs"]):
 
             model.train()
+            epoch_start_time = time.time()
+            epoch_start_step = global_step
+            epoch_loss_total = 0.0
+            epoch_loss_count = 0
             progress = tqdm(
                 train_loader,
                 disable=not accelerator.is_local_main_process,
@@ -497,6 +598,7 @@ def main():
             for step, batch in enumerate(progress):
                 if INTERRUPT_REQUESTED:
                     accelerator.print("\nStop richiesto: salvo checkpoint e chiudo.\n")
+                    metrics_final_status = "interrupted"
                     return
 
                 with accelerator.accumulate(model):
@@ -569,6 +671,8 @@ def main():
                         perplexity = math.exp(min(avg_loss, 20))
                         current_lr = scheduler.get_last_lr()[0]
                         last_lr = current_lr
+                        epoch_loss_total += avg_loss
+                        epoch_loss_count += 1
 
                         tokens = batch["input_ids"].numel() * accumulation_steps
                         allocated_gb, reserved_gb = cuda_memory_gb()
@@ -583,6 +687,24 @@ def main():
                             f"VRAM {allocated_gb:.1f}/{reserved_gb:.1f}GB",
                             refresh=True,
                         )
+
+                        if accelerator.is_main_process:
+                            record_metric(
+                                metrics_path,
+                                metrics,
+                                "train",
+                                {
+                                    "epoch": epoch + 1,
+                                    "global_step": global_step,
+                                    "total_steps": total_steps,
+                                    "loss": avg_loss,
+                                    "perplexity": perplexity,
+                                    "learning_rate": current_lr,
+                                    "tokens": tokens,
+                                    "vram_allocated_gb": allocated_gb,
+                                    "vram_reserved_gb": reserved_gb,
+                                },
+                            )
 
                         # SAVE A TEMPO
                         current_time = time.time()
@@ -622,17 +744,71 @@ def main():
                                 f"PPL {eval_ppl:.2f}\n"
                             )
 
+                            if accelerator.is_main_process:
+                                record_metric(
+                                    metrics_path,
+                                    metrics,
+                                    "eval",
+                                    {
+                                        "epoch": epoch + 1,
+                                        "global_step": global_step,
+                                        "total_steps": total_steps,
+                                        "loss": eval_loss,
+                                        "perplexity": eval_ppl,
+                                        "learning_rate": current_lr,
+                                    },
+                                )
+
                             model.train()
 
                         if max_steps and global_step >= max_steps:
+                            if accelerator.is_main_process:
+                                avg_epoch_loss = epoch_loss_total / max(epoch_loss_count, 1)
+                                record_epoch_metrics(
+                                    metrics_path,
+                                    metrics,
+                                    {
+                                        "epoch": epoch + 1,
+                                        "complete": False,
+                                        "start_global_step": epoch_start_step,
+                                        "end_global_step": global_step,
+                                        "duration_seconds": time.time() - epoch_start_time,
+                                        "train_loss": avg_epoch_loss,
+                                        "train_perplexity": math.exp(min(avg_epoch_loss, 20)),
+                                    },
+                                )
+                                metrics_final_status = "stopped_at_max_steps"
                             return
+
+            if accelerator.is_main_process:
+                avg_epoch_loss = epoch_loss_total / max(epoch_loss_count, 1)
+                record_epoch_metrics(
+                    metrics_path,
+                    metrics,
+                    {
+                        "epoch": epoch + 1,
+                        "complete": True,
+                        "start_global_step": epoch_start_step,
+                        "end_global_step": global_step,
+                        "duration_seconds": time.time() - epoch_start_time,
+                        "train_loss": avg_epoch_loss,
+                        "train_perplexity": math.exp(min(avg_epoch_loss, 20)),
+                    },
+                )
 
     except KeyboardInterrupt:
         request_stop()
+        metrics_final_status = "interrupted"
         accelerator.print("\nInterruzione ricevuta. Salvo checkpoint prima di uscire...\n")
+
+    except Exception:
+        metrics_final_status = "failed"
+        raise
 
     finally:
         if accelerator.is_main_process:
+            if metrics_path and metrics:
+                update_metrics_status(metrics_path, metrics, metrics_final_status, global_step)
             try:
                 save_checkpoint(
                     accelerator,

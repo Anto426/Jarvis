@@ -240,6 +240,88 @@ function Invoke-JarvisTraining {
     }
 }
 
+function Start-JarvisDashboard {
+    param(
+        [string]$Root = (Get-JarvisRoot),
+        [int]$Port = 8765,
+        [switch]$Foreground
+    )
+
+    $DashboardDir = Join-Path $Root "web\training-dashboard"
+    if (-not (Test-Path $DashboardDir)) {
+        Write-Host "Dashboard non trovata: $DashboardDir"
+        return $null
+    }
+
+    $Npm = Get-Command "npm.cmd" -ErrorAction SilentlyContinue
+    if (-not $Npm) {
+        $Npm = Get-Command "npm" -ErrorAction SilentlyContinue
+    }
+    if (-not $Npm) {
+        Write-Host "npm non trovato nel PATH. Installa Node.js per avviare la dashboard Next.js."
+        return $null
+    }
+
+    $NodeModules = Join-Path $DashboardDir "node_modules"
+    if (-not (Test-Path $NodeModules)) {
+        Write-Host "Dipendenze dashboard mancanti: eseguo npm install..."
+        Push-Location $DashboardDir
+        try {
+            & $Npm.Source install
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "npm install fallito per la dashboard."
+                return $null
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+
+    $env:JARVIS_DASHBOARD_PORT = "$Port"
+    $env:NEXT_TELEMETRY_DISABLED = "1"
+    $Url = "http://127.0.0.1:$Port"
+
+    Write-Host ""
+    Write-Host ">>> Dashboard training Next.js"
+    Write-Host "URL: $Url"
+
+    $ExistingListener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($ExistingListener) {
+        Write-Host "Dashboard/porta gia attiva (PID $($ExistingListener.OwningProcess)). Uso quella."
+        return (Get-Process -Id $ExistingListener.OwningProcess -ErrorAction SilentlyContinue)
+    }
+
+    $Args = @("run", "dev", "--", "--hostname", "127.0.0.1", "--port", "$Port")
+
+    if ($Foreground) {
+        Push-Location $DashboardDir
+        try {
+            & $Npm.Source @Args
+            return $null
+        }
+        finally {
+            Pop-Location
+        }
+    }
+
+    $Process = Start-Process `
+        -FilePath $Npm.Source `
+        -ArgumentList $Args `
+        -WorkingDirectory $DashboardDir `
+        -WindowStyle Hidden `
+        -PassThru
+
+    Start-Sleep -Seconds 2
+    if ($Process.HasExited) {
+        Write-Host "Dashboard non avviata. Prova manualmente: cd web\training-dashboard; npm run dev -- --hostname 127.0.0.1 --port $Port"
+        return $null
+    }
+
+    return $Process
+}
+
 function Get-JarvisBestMixedPrecision {
     param([string]$Root = (Get-JarvisRoot))
 

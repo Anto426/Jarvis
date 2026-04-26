@@ -72,6 +72,20 @@ Run Jarvis. The launcher checks/configures the Python environment, builds the da
 powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1
 ```
 
+The launcher also starts the local training dashboard at `http://127.0.0.1:8765`.
+
+Run only the dashboard:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -DashboardOnly
+```
+
+Run training without the dashboard:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -NoDashboard
+```
+
 Update and check dependencies before running:
 
 ```powershell
@@ -181,6 +195,27 @@ Key defaults:
 - CUDA fast path: TF32, SDPA attention, fused optimizer
 - Max performance mode: `torch.compile` and automatic VRAM-based batch tuning
 - Checkpoint limit: `3`
+
+During training Jarvis writes live metrics to:
+
+```text
+logs/training_metrics.json
+```
+
+The JSON contains step history, validation points, current loss/perplexity/learning rate, and a summary for each epoch.
+
+The dashboard is a dark Next.js app built with shadcn/ui components. To open it directly:
+
+```powershell
+cd web\training-dashboard
+npm run dev -- --hostname 127.0.0.1 --port 8765
+```
+
+Then browse to:
+
+```text
+http://127.0.0.1:8765
+```
 
 <p align="center">
   <img src="./asset/divider.gif" width="440" height="40" />

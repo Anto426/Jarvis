@@ -9,6 +9,9 @@ param(
     [switch]$UpdateDeps,
     [switch]$SkipDependencyCheck,
     [switch]$SkipTraining,
+    [switch]$NoDashboard,
+    [switch]$DashboardOnly,
+    [int]$DashboardPort = 8765,
     [ValidateSet("auto", "0", "force")]
     [string]$HuggingFace = "auto"
 )
@@ -65,6 +68,11 @@ if (-not $SkipDependencyCheck) {
 }
 
 $Python = Get-JarvisPython -Root $Root
+
+if ($DashboardOnly) {
+    Start-JarvisDashboard -Root $Root -Port $DashboardPort -Foreground
+    exit 0
+}
 
 if ($InstallFlashAttention) {
     if (-not (Install-JarvisFlashAttention -Root $Root -AllowExperimentalWindows:$ForceExperimentalFlashAttentionInstall)) {
@@ -247,6 +255,13 @@ if ($ShouldBuildData) {
 if ($SkipTraining) {
     Write-Host "SkipTraining attivo: mi fermo dopo la verifica/generazione dati."
     exit 0
+}
+
+if (-not $NoDashboard) {
+    $DashboardProcess = Start-JarvisDashboard -Root $Root -Port $DashboardPort
+    if ($DashboardProcess) {
+        Write-Host "Dashboard avviata in background (PID $($DashboardProcess.Id))."
+    }
 }
 
 $MixedPrecision = Get-JarvisBestMixedPrecision -Root $Root
