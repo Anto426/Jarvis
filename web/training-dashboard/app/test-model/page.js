@@ -3,23 +3,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
-  Activity,
   AlertTriangle,
   ArrowLeft,
   Bot,
-  BrainCircuit,
-  Clock,
+  Cpu,
   Database,
+  History,
+  Layers,
   Loader2,
-  Monitor,
+  MessageSquare,
   Power,
   RefreshCcw,
   RotateCcw,
   Send,
-  Server,
-  SlidersHorizontal,
+  Settings2,
   Terminal,
-  User,
+  Zap,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -28,14 +27,16 @@ const initialMessages = [
   {
     id: "welcome",
     role: "assistant",
-    content: "Ciao, sono Jarvis. Dimmi pure cosa vuoi testare.",
+    content: "Sistemi online. Pronto per l'analisi del checkpoint caricato. In cosa posso esserti utile?",
     createdAt: new Date().toISOString(),
   },
 ];
 
-function formatStatus(value) {
-  return value ? "online" : "standby";
-}
+const promptPresets = [
+  "Analisi di sistema: continua...",
+  "Stato del training attuale",
+  "Diagnostica errore",
+];
 
 function makeMessage(role, content) {
   return {
@@ -71,124 +72,57 @@ function buildModelPrompt(messages, mode) {
   return [...recent, "<|assistant|>\n"].join("\n");
 }
 
-function StatusBar({ status }) {
-  const [time, setTime] = useState(null);
+function formatTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
-  useEffect(() => {
-    const update = () => setTime(new Date().toLocaleTimeString());
-    const initial = setTimeout(update, 0);
-    const timer = setInterval(update, 1000);
-    return () => {
-      clearTimeout(initial);
-      clearInterval(timer);
-    };
-  }, []);
+function GlassPanel({ title, icon: Icon, action, children, className = "", contentClassName = "p-6", style = {} }) {
+  return (
+    <section className={`relative flex flex-col rounded-3xl border border-white/5 bg-white/[0.02] backdrop-blur-md overflow-hidden ${className}`} style={style}>
+      <div className="flex shrink-0 min-h-14 items-center justify-between border-b border-white/5 px-6">
+        <div className="flex items-center gap-3">
+          {Icon ? <Icon size={18} className="text-white/50" /> : null}
+          <h2 className="text-xs font-bold uppercase tracking-wider text-white/80">{title}</h2>
+        </div>
+        {action}
+      </div>
+      <div className={`relative flex-1 flex flex-col min-h-0 ${contentClassName}`}>{children}</div>
+    </section>
+  );
+}
 
-  const workerRunning = Boolean(status?.worker?.running);
+function DetailRow({ label, value, tone = "text-white/70" }) {
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-white/5 py-3 last:border-b-0 group">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-white/40 group-hover:text-white/60 transition-colors">{label}</span>
+      <span className={`min-w-0 truncate text-right text-xs font-medium ${tone}`}>{value || "-"}</span>
+    </div>
+  );
+}
+
+function ModernStatBox({ label, value, subValue, icon: Icon, color = "white" }) {
+  const colorMap = {
+    white: "text-white",
+    emerald: "text-emerald-400",
+    amber: "text-amber-400",
+    blue: "text-blue-400",
+  };
 
   return (
-    <div className="w-full bg-white/[0.02] border-b border-white/[0.05] py-2 px-6 sm:px-10 flex items-center justify-between text-[9px] font-black uppercase tracking-[0.2em] text-white/30 backdrop-blur-3xl">
-      <div className="flex items-center gap-8">
+    <div className="group relative overflow-hidden rounded-3xl border border-white/5 bg-white/[0.02] backdrop-blur-md p-6 transition-colors duration-300 hover:bg-white/[0.04]">
+      <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2.5">
-          <div className={`size-1.5 rounded-full ${workerRunning ? "bg-emerald-500 animate-pulse shadow-[0_0_10px_#10b981]" : "bg-white/20"}`} />
-          <span className="text-white/50">Inference Core: {workerRunning ? "Active" : "Standby"}</span>
-        </div>
-        <div className="hidden md:flex items-center gap-2">
-          <Server size={10} className="text-white/10" />
-          <span>Jarvis-Protocol-01</span>
+          {Icon && <Icon size={16} className="text-white/40 group-hover:text-white/60 transition-colors" />}
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-white/50">{label}</span>
         </div>
       </div>
-      <div className="flex items-center gap-8">
-        <div className="flex items-center gap-2 font-mono">
-          <Monitor size={10} className="text-white/10" />
-          <span className="text-white/40">Mode: Inference</span>
+      <div className="mt-4">
+        <div className={`text-3xl sm:text-4xl font-bold tracking-tight ${colorMap[color] || colorMap.white}`}>
+          {value || "-"}
         </div>
-        <div className="flex items-center gap-2 font-mono">
-          <Clock size={10} className="text-white/10" />
-          <span className="text-white/40">{time || "--:--:--"}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function PageHeader({ status, onRefresh, isRefreshing }) {
-  const checkpointReady = Boolean(status?.checkpoint?.modelFile);
-  const tokenizerReady = Boolean(status?.tokenizer?.available);
-
-  return (
-    <div className="mb-12 admin-fade-up sticky top-0 z-20 bg-background/20 backdrop-blur-3xl py-6 border-b border-white/[0.03] -mx-6 px-6 sm:-mx-10 sm:px-10 group/header">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 w-full">
-        <div className="flex items-center gap-6">
-          <div className="size-12 rounded-2xl bg-white flex items-center justify-center text-black shadow-xl">
-            <BrainCircuit size={24} />
-          </div>
-          <div>
-            <p className="text-[9px] text-white/15 font-black uppercase tracking-[0.4em] mb-1">Neural Inference</p>
-            <div className="flex items-center gap-4">
-              <h1 className="text-4xl font-black tracking-tighter text-white text-glow leading-none">Chat Test</h1>
-              <Badge className={`rounded-full px-4 py-1.5 text-[10px] font-black uppercase tracking-[0.3em] transition-all duration-700 ${checkpointReady && tokenizerReady ? 'bg-white text-black animate-pulse' : 'bg-white/5 text-white/30 border-white/10'}`}>
-                {checkpointReady && tokenizerReady ? "READY" : "WAITING"}
-              </Badge>
-            </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-4">
-          <button
-            onClick={onRefresh}
-            className="size-12 rounded-xl bg-white/[0.02] border border-white/10 flex items-center justify-center transition-all hover:bg-white hover:text-black group"
-          >
-            <RefreshCcw size={18} className={`${isRefreshing ? "animate-spin" : ""} group-hover:rotate-180 transition-transform duration-700`} />
-          </button>
-          <Link
-            href="/"
-            className="px-8 h-12 rounded-xl bg-white/[0.04] border border-white/10 text-white text-[12px] font-black uppercase tracking-[0.24em] hover:bg-white hover:text-black transition-all flex items-center gap-3"
-          >
-            <ArrowLeft size={14} /> Dashboard
-          </Link>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function StatCard({ icon: Icon, label, value, tone = "text-white" }) {
-  return (
-    <div className="glass-card rounded-[1.5rem] p-5 border border-white/[0.04] relative overflow-hidden group/tel">
-      <div className="relative z-10 flex flex-col justify-between h-full">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2.5">
-            <div className="p-1.5 rounded-lg bg-white/[0.02] text-white/20 group-hover/tel:text-white transition-colors">
-              <Icon size={14} />
-            </div>
-            <span className="text-[9px] font-black uppercase tracking-[0.15em] text-white/20">{label}</span>
-          </div>
-        </div>
-        <p className={`text-base font-black tracking-tight tabular-nums truncate ${tone}`}>{value || "-"}</p>
-      </div>
-    </div>
-  );
-}
-
-function CheckpointWarning({ checkpoint }) {
-  const warnings = checkpoint?.warnings || [];
-  if (!warnings.length) return null;
-
-  const stage = checkpoint?.pipelineStep?.id || "stage sconosciuto";
-  const source = checkpoint?.source === "official" ? "official" : "snapshot";
-
-  return (
-    <div className="mb-12 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] px-6 py-5 text-amber-100/80 admin-fade-up">
-      <div className="flex items-start gap-4">
-        <div className="mt-0.5 shrink-0 rounded-lg bg-amber-300 text-black p-2">
-          <AlertTriangle size={17} />
-        </div>
-        <div className="min-w-0">
-          <div className="text-[10px] font-black uppercase tracking-[0.28em] text-amber-200/70">
-            Checkpoint {source} · {stage}
-          </div>
-          <p className="mt-2 text-sm leading-6 text-amber-50/75">{warnings.join(" ")}</p>
-        </div>
+        {subValue && <div className="mt-2 text-xs font-medium text-white/40">{subValue}</div>}
       </div>
     </div>
   );
@@ -196,33 +130,43 @@ function CheckpointWarning({ checkpoint }) {
 
 function ControlSlider({ label, value, min, max, step, onChange }) {
   return (
-    <label className="block">
-      <div className="flex items-center justify-between gap-4 mb-3">
-        <span className="text-[10px] font-black uppercase tracking-[0.25em] text-white/20">{label}</span>
-        <span className="text-[11px] font-black tabular-nums text-white/60">{value}</span>
+    <label className="block group">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-white/40 group-hover:text-white/60 transition-colors">{label}</span>
+        <span className="font-mono text-[10px] font-bold text-white/80 bg-white/5 px-2 py-1 rounded-md border border-white/5 shadow-inner">{value}</span>
       </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-        className="w-full accent-white h-1 bg-white/5 rounded-full appearance-none cursor-pointer"
-      />
+      <div className="relative h-1.5 rounded-full bg-black/50 shadow-inner overflow-hidden border border-white/5">
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="absolute inset-0 w-full cursor-pointer appearance-none bg-transparent outline-none z-10 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:shadow-[0_0_10px_rgba(255,255,255,0.8)] [&::-webkit-slider-thumb]:transition-transform hover:[&::-webkit-slider-thumb]:scale-110"
+        />
+        <div 
+          className="absolute top-0 left-0 h-full rounded-full bg-white/20 pointer-events-none transition-all" 
+          style={{ width: `${((value - min) / (max - min)) * 100}%` }} 
+        />
+      </div>
     </label>
   );
 }
 
 function ModeControl({ value, onChange }) {
   return (
-    <div className="grid grid-cols-2 gap-1 rounded-2xl border border-white/[0.06] bg-black/45 p-1">
+    <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/5 bg-black/40 p-1 shadow-inner">
       {["classic", "chat"].map((mode) => (
         <button
           key={mode}
           type="button"
           onClick={() => onChange(mode)}
-          className={`h-10 rounded-xl text-[10px] font-black uppercase tracking-[0.24em] transition-all ${value === mode ? "bg-white text-black" : "text-white/30 hover:text-white/70"}`}
+          className={`h-8 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all duration-300 ${
+            value === mode 
+              ? "bg-white/10 text-white shadow-[0_0_15px_rgba(255,255,255,0.1)] border border-white/20" 
+              : "text-white/40 hover:text-white/70 hover:bg-white/5 border border-transparent"
+          }`}
         >
           {mode}
         </button>
@@ -231,70 +175,32 @@ function ModeControl({ value, onChange }) {
   );
 }
 
-function SurfaceCard({ title, icon: Icon, children, className = "", description }) {
-  return (
-    <div className={`surface-elevated rounded-[2.5rem] admin-fade-up group/card ${className}`}>
-      <div className="px-10 py-7 border-b border-white/[0.04] flex items-center justify-between relative z-10">
-        <div className="flex items-center gap-4">
-          {Icon ? (
-            <div className="size-10 rounded-xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/45 group-hover/card:bg-white group-hover/card:text-black transition-all duration-500">
-              <Icon size={17} />
-            </div>
-          ) : (
-            <div className="size-3 rounded-full bg-white shadow-[0_0_15px_rgba(255,255,255,0.6)] animate-pulse" />
-          )}
-          <div>
-            <h2 className="text-xs font-black uppercase tracking-[0.4em] text-white/80">{title}</h2>
-            {description && <p className="text-[9px] font-bold text-white/10 uppercase tracking-widest mt-1">{description}</p>}
-          </div>
-        </div>
-      </div>
-      <div className={`p-10 relative z-10 ${className.includes('flex-col') ? 'flex-1 flex flex-col' : ''}`}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
 function ChatMessage({ message }) {
   const isUser = message.role === "user";
-  const Icon = isUser ? User : Bot;
 
   return (
-    <div className={`flex items-start gap-6 ${isUser ? "justify-end" : "justify-start"} admin-fade-up`}>
-      {!isUser && (
-        <div className="size-12 shrink-0 rounded-2xl bg-white text-black flex items-center justify-center shadow-2xl">
-          <Icon size={20} />
+    <div className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}>
+      <div className={`relative max-w-[85%] rounded-3xl px-6 py-5 shadow-xl ${
+        isUser 
+          ? "bg-white text-black" 
+          : "border border-white/5 bg-white/[0.02] backdrop-blur-md text-white/90"
+      }`}>
+        <div className={`mb-3 flex items-center gap-3 text-[10px] font-bold uppercase tracking-wider ${
+          isUser ? "text-black/50" : "text-white/40"
+        }`}>
+          <div className="flex items-center gap-2">
+            {isUser ? <History size={12} /> : <Bot size={14} className="text-emerald-400" />}
+            {isUser ? "Operatore" : "J.A.R.V.I.S."}
+          </div>
+          <span className="font-mono font-medium opacity-50">{formatTime(message.createdAt)}</span>
         </div>
-      )}
-      <div className={`max-w-[86%] md:max-w-[75%] rounded-[2rem] px-8 py-6 border shadow-2xl transition-all duration-500 ${isUser ? "bg-white text-black border-white hover:shadow-white/5" : "bg-white/[0.03] text-white/80 border-white/[0.06] hover:bg-white/[0.05]"}`}>
-        <div className={`mb-3 flex items-center justify-between gap-8 text-[9px] font-black uppercase tracking-[0.3em] ${isUser ? "text-black/40" : "text-white/20"}`}>
-          <span className="flex items-center gap-2">
-            {isUser ? <User size={10} /> : <Bot size={10} />}
-            {isUser ? "Authorized User" : "Jarvis System"}
-          </span>
-          <span className="font-mono opacity-50">{new Date(message.createdAt).toLocaleTimeString()}</span>
-        </div>
-        <p className="text-base leading-8 tracking-tight selection:bg-black selection:text-white">{message.content}</p>
-      </div>
-      {isUser && (
-        <div className="size-12 shrink-0 rounded-2xl bg-white/[0.04] border border-white/[0.08] text-white/50 flex items-center justify-center shadow-xl">
-          <Icon size={20} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TypingRow() {
-  return (
-    <div className="flex items-start gap-4">
-      <div className="size-10 shrink-0 rounded-xl bg-white text-black flex items-center justify-center shadow-xl">
-        <Bot size={17} />
-      </div>
-      <div className="rounded-2xl border border-white/[0.06] bg-black/55 px-5 py-4 text-white/35 flex items-center gap-3">
-        <Loader2 size={16} className="animate-spin" />
-        <span className="text-[10px] font-black uppercase tracking-[0.3em]">generazione</span>
+        <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed font-medium">
+          {message.content}
+        </p>
+        
+        {!isUser && (
+          <div className="absolute -left-px top-1/2 h-8 w-0.5 -translate-y-1/2 bg-emerald-400/50 shadow-[0_0_10px_rgba(52,211,153,0.5)] rounded-full" />
+        )}
       </div>
     </div>
   );
@@ -320,8 +226,7 @@ export default function TestModelPage() {
     setIsRefreshing(true);
     try {
       const response = await fetch("/api/model/status", { cache: "no-store" });
-      const payload = await response.json();
-      setStatus(payload);
+      setStatus(await response.json());
     } catch {
       setStatus(null);
     } finally {
@@ -338,16 +243,11 @@ export default function TestModelPage() {
     };
   }, [refreshStatus]);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, isGenerating]);
-
-  const checkpointName = status?.checkpoint?.name || "nessun checkpoint";
-  const checkpointFile = status?.checkpoint?.modelFile || "missing";
-  const tokenizerState = status?.tokenizer?.available ? "jarvis.model" : "missing";
-  const workerState = status?.worker?.running ? "active" : "idle";
-  const modelReady = Boolean(status?.checkpoint?.modelFile && status?.tokenizer?.available);
-  const canCloseModel = Boolean(status?.worker?.running) && !isClosing;
+  const checkpoint = status?.checkpoint;
+  const workerRunning = Boolean(status?.worker?.running);
+  const tokenizerReady = Boolean(status?.tokenizer?.available);
+  const modelReady = Boolean(checkpoint?.modelFile && tokenizerReady);
+  const canCloseModel = workerRunning && !isClosing;
   const chatTurns = Math.max(0, messages.filter((message) => message.id !== "welcome").length);
   const canSend = useMemo(() => draft.trim().length > 0 && !isGenerating && modelReady, [draft, isGenerating, modelReady]);
 
@@ -376,7 +276,7 @@ export default function TestModelPage() {
       }
 
       setLastStats(null);
-      setMessages((items) => [...items, makeMessage("assistant", "Modello chiuso. La prossima risposta lo ricarichera'.")]);
+      setMessages((items) => [...items, makeMessage("assistant", "Protocollo di chiusura completato. Modello scaricato dalla memoria.")]);
       setStatus((current) => ({
         ...current,
         worker: {
@@ -396,7 +296,7 @@ export default function TestModelPage() {
   }
 
   async function submitMessage(event) {
-    event.preventDefault();
+    if (event) event.preventDefault();
     if (!canSend) return;
 
     const userMessage = makeMessage("user", draft.trim());
@@ -443,132 +343,249 @@ export default function TestModelPage() {
   }
 
   return (
-    <main className="min-h-screen w-full pb-24 font-sans overflow-x-hidden">
-      <StatusBar status={status} />
-
-      <div className="px-6 sm:px-10">
-        <PageHeader status={status} onRefresh={refreshStatus} isRefreshing={isRefreshing} />
-
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 mb-12">
-          <StatCard icon={Database} label="Checkpoint" value={checkpointName} />
-          <StatCard icon={Terminal} label="Model File" value={checkpointFile} />
-          <StatCard icon={Bot} label="Tokenizer" value={tokenizerState} />
-          <StatCard icon={Activity} label="Core State" value={workerState} tone={status?.worker?.running ? "text-emerald-300" : "text-white/50"} />
+    <main className="mx-auto max-w-[1600px] min-h-screen w-full overflow-x-hidden px-4 py-8 font-sans sm:px-8 lg:px-12 bg-[#0a0a0a] text-white selection:bg-white/20">
+      {/* Header Section */}
+      <header className="mb-10 flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
+        <div className="space-y-4">
+          <div className="flex items-center gap-4">
+            <Link
+              href="/"
+              className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/5 bg-white/[0.02] text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+            >
+              <ArrowLeft size={18} className="transition-transform hover:-translate-x-1" />
+            </Link>
+            <div className="h-10 w-px bg-white/10" />
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge className={`rounded-lg px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider border-none ${
+                modelReady 
+                  ? "bg-emerald-500/10 text-emerald-400 shadow-[0_0_15px_rgba(52,211,153,0.15)]" 
+                  : "bg-white/5 text-white/50 border border-white/10"
+              }`}>
+                {modelReady ? "System Online" : "System Standby"}
+              </Badge>
+              <span className="text-[10px] font-mono font-bold text-white/40 tracking-wider">
+                NODE_ID: {checkpoint?.pipelineStep?.id || "NULL"}
+              </span>
+            </div>
+          </div>
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight text-white md:text-4xl">
+              Model <span className="text-white/40">Interface</span>
+            </h1>
+            <p className="mt-2 text-xs font-medium text-white/40">
+              Laboratorio di test e validazione checkpoint
+            </p>
+          </div>
         </div>
 
-        <CheckpointWarning checkpoint={status?.checkpoint} />
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={refreshStatus}
+            className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/5 bg-white/[0.02] text-white/60 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <RefreshCcw size={16} className={isRefreshing ? "animate-spin" : ""} />
+          </button>
+        </div>
+      </header>
 
-        <div className="grid grid-cols-1 xl:grid-cols-12 gap-10 items-start">
-          <div className="xl:col-span-8">
-            <SurfaceCard title="Neural Sequence" description="Direct interface stream" className="min-h-[750px] flex flex-col relative overflow-hidden">
-              <div className="absolute top-0 right-0 p-10 opacity-[0.02] pointer-events-none">
-                <BrainCircuit size={400} />
-              </div>
+      {/* Quick Stats Grid */}
+      <section className="mb-8 grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+        <ModernStatBox 
+          label="Checkpoint Active" 
+          value={checkpoint?.name || "None"} 
+          subValue={checkpoint?.source}
+          icon={Zap}
+          color="white"
+        />
+        <ModernStatBox 
+          label="Model Weights" 
+          value={checkpoint?.modelFile ? "Loaded" : "Missing"} 
+          subValue={checkpoint?.modelFile}
+          icon={Layers}
+          color={checkpoint?.modelFile ? "emerald" : "amber"}
+        />
+        <ModernStatBox 
+          label="Tokenizer" 
+          value={tokenizerReady ? "Ready" : "Offline"} 
+          subValue="HuggingFace / Local"
+          icon={Cpu}
+          color={tokenizerReady ? "emerald" : "amber"}
+        />
+        <ModernStatBox 
+          label="Process Engine" 
+          value={workerRunning ? "Active" : "Idle"} 
+          subValue={status?.worker?.startedAt ? `Started ${formatTime(status.worker.startedAt)}` : "Waiting for trigger"}
+          icon={Terminal}
+          color={workerRunning ? "blue" : "white"}
+        />
+      </section>
 
-              <div className="flex-1 overflow-auto custom-scrollbar pr-4 -mr-4 space-y-10 min-h-[500px]">
-                {messages.map((message) => (
-                  <ChatMessage key={message.id} message={message} />
-                ))}
-                {isGenerating && <TypingRow />}
-                <div ref={messagesEndRef} />
-              </div>
+      {checkpoint?.warnings?.length > 0 && (
+        <div className="mb-8">
+          <div className="rounded-3xl border border-amber-500/20 bg-amber-500/5 px-6 py-5 flex items-center gap-5">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-400">
+              <AlertTriangle size={20} />
+            </div>
+            <div>
+              <div className="text-[11px] font-bold uppercase tracking-wider text-amber-400 mb-1">Nota di sistema</div>
+              <p className="text-sm font-medium text-amber-200/80">{checkpoint.warnings.join(" ")}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
-              {error && (
-                <div className="mt-8 rounded-2xl border border-red-500/20 bg-red-500/5 px-6 py-4 text-xs font-black uppercase tracking-widest text-red-400/80 animate-pulse">
-                  System Error: {error}
+      {/* Main Workspace */}
+      <div className="grid grid-cols-1 gap-8 xl:grid-cols-[1fr_420px]">
+        {/* Chat Console */}
+        <div className="relative min-h-[600px] xl:min-h-0">
+          <div className="h-full xl:absolute xl:inset-0">
+            <GlassPanel 
+              title="Neural Console" 
+              icon={MessageSquare} 
+              className="h-full min-h-0"
+              contentClassName=""
+            >
+          <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+            <div className="flex-1 overflow-y-auto p-6 sm:p-8 custom-scrollbar space-y-6">
+              {messages.map((message) => (
+                <ChatMessage key={message.id} message={message} />
+              ))}
+              {isGenerating && (
+                <div className="flex items-center gap-4 px-6 py-4 rounded-3xl border border-white/5 bg-white/[0.02] w-fit">
+                  <Loader2 size={16} className="animate-spin text-emerald-400" />
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400/80">Generazione in corso...</span>
                 </div>
               )}
+              <div ref={messagesEndRef} />
+            </div>
 
-              <form onSubmit={submitMessage} className="mt-10 flex items-end gap-6 relative z-10">
-                <div className="flex-1 relative group">
-                  <textarea
-                    value={draft}
-                    onChange={(event) => setDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        submitMessage(event);
-                      }
-                    }}
-                    className="min-h-16 max-h-44 w-full resize-none rounded-[1.5rem] border border-white/[0.06] bg-black/45 px-8 py-5 text-base leading-relaxed text-white/90 outline-none transition-all placeholder:text-white/10 focus:border-white/20 focus:bg-black/60 shadow-inner"
-                    placeholder="Input command..."
-                    rows={1}
-                  />
-                  <div className="absolute bottom-4 right-6 flex items-center gap-3 text-[9px] font-black uppercase tracking-widest text-white/10 group-focus-within:text-white/30 transition-colors">
-                    <span>Shift+Enter for newline</span>
-                  </div>
-                </div>
+            {error && (
+              <div className="mx-6 mb-4 rounded-2xl border border-red-500/20 bg-red-500/5 p-4 text-xs font-bold text-red-400 flex items-center gap-3">
+                <AlertTriangle size={14} />
+                {error}
+              </div>
+            )}
+
+            <div className="p-6 border-t border-white/5 bg-black/20">
+              <div className="mb-4 flex flex-wrap gap-2">
+                {promptPresets.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setDraft(preset)}
+                    className="rounded-full border border-white/5 bg-white/[0.02] px-4 py-2 text-[10px] font-bold uppercase tracking-wider text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
+              
+              <div className="relative group">
+                <textarea
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      submitMessage();
+                    }
+                  }}
+                  rows={draft.split('\n').length > 1 ? 3 : 1}
+                  className="w-full resize-none rounded-2xl border border-white/10 bg-white/[0.02] backdrop-blur-md pl-6 pr-16 py-4 text-sm leading-relaxed text-white outline-none placeholder:text-white/30 transition-colors focus:bg-white/[0.04] focus:border-white/20 min-h-[56px] max-h-48 custom-scrollbar"
+                  placeholder={modelReady ? "Inserisci istruzioni per J.A.R.V.I.S..." : "In attesa di inizializzazione sistema..."}
+                  disabled={!modelReady || isGenerating}
+                />
                 <button
-                  type="submit"
+                  onClick={submitMessage}
                   disabled={!canSend}
-                  className="size-16 shrink-0 rounded-2xl bg-white text-black hover:scale-105 active:scale-95 disabled:scale-100 disabled:cursor-not-allowed disabled:opacity-20 transition-all shadow-[0_20px_50px_rgba(255,255,255,0.15)] flex items-center justify-center group"
+                  className="absolute right-3 top-3 h-10 w-10 flex items-center justify-center rounded-xl bg-white text-black transition-all hover:scale-105 active:scale-95 disabled:opacity-20 disabled:hover:scale-100 shadow-[0_0_15px_rgba(255,255,255,0.2)]"
                 >
-                  {isGenerating ? <Loader2 size={24} className="animate-spin" /> : <Send size={24} className="group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform" />}
+                  {isGenerating ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
                 </button>
-              </form>
-            </SurfaceCard>
+              </div>
+            </div>
           </div>
-
-          <div className="xl:col-span-4 space-y-10">
-            <SurfaceCard title="Sampling" description="Response parameters" icon={SlidersHorizontal}>
-              <div className="space-y-10">
-                <ModeControl value={promptMode} onChange={setPromptMode} />
-                <div className="space-y-8">
-                  <ControlSlider label="Max Tokens" value={maxNewTokens} min={1} max={512} step={1} onChange={setMaxNewTokens} />
-                  <ControlSlider label="Temperature" value={temperature} min={0.1} max={2} step={0.1} onChange={setTemperature} />
-                  <ControlSlider label="Top P" value={topP} min={0.1} max={1} step={0.05} onChange={setTopP} />
-                  <ControlSlider label="Repeat Penalty" value={repetitionPenalty} min={1} max={1.6} step={0.05} onChange={setRepetitionPenalty} />
-                </div>
-              </div>
-            </SurfaceCard>
-
-            <SurfaceCard title="Session" description="Active metrics" icon={Terminal}>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between py-6 border-b border-white/[0.04]">
-                  <div className="flex items-center gap-4">
-                    <div className="size-2 rounded-full bg-white/20" />
-                    <span className="text-[10px] font-black uppercase tracking-[0.3em] text-white/20">Turns</span>
-                  </div>
-                  <span className="text-xl font-black tabular-nums text-white">{chatTurns}</span>
-                </div>
-                <div className="flex items-center justify-between py-6 border-b border-white/[0.04]">
-                  <div className="flex items-center gap-4">
-                    <div className="size-2 rounded-full bg-white/20" />
-                    <span className="text-[10px] font-black uppercase tracking-[0.3em] text-white/20">Input</span>
-                  </div>
-                  <span className="text-xl font-black tabular-nums text-white/60">{lastStats?.input_tokens || "-"}</span>
-                </div>
-                <div className="flex items-center justify-between py-6 border-b border-white/[0.04]">
-                  <div className="flex items-center gap-4">
-                    <div className="size-2 rounded-full bg-emerald-500/40" />
-                    <span className="text-[10px] font-black uppercase tracking-[0.3em] text-white/20">Generated</span>
-                  </div>
-                  <span className="text-xl font-black tabular-nums text-emerald-400">{lastStats?.generated_tokens || "-"}</span>
-                </div>
-                
-                <div className="grid grid-cols-2 gap-4 mt-10">
-                  <button
-                    type="button"
-                    onClick={resetChat}
-                    className="h-14 rounded-2xl bg-white/[0.03] border border-white/10 text-[10px] font-black uppercase tracking-[0.3em] text-white/40 hover:bg-white hover:text-black transition-all flex items-center justify-center gap-3 group"
-                  >
-                    <RotateCcw size={16} className="group-hover:rotate-180 transition-transform duration-500" />
-                    Reset
-                  </button>
-                  <button
-                    type="button"
-                    onClick={closeModel}
-                    disabled={!canCloseModel}
-                    className="h-14 rounded-2xl bg-red-500/10 border border-red-500/20 text-[10px] font-black uppercase tracking-[0.3em] text-red-400 hover:bg-red-500 hover:text-white disabled:opacity-5 transition-all flex items-center justify-center gap-3"
-                  >
-                    {isClosing ? <Loader2 size={16} className="animate-spin" /> : <Power size={16} />}
-                    Close Model
-                  </button>
-                </div>
-              </div>
-            </SurfaceCard>
+        </GlassPanel>
           </div>
         </div>
+
+        {/* Sidebar Controls */}
+        <aside className="space-y-6">
+          <GlassPanel title="Configuration" icon={Settings2}>
+            <div className="space-y-6">
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-wider text-white/40 mb-3 px-1">Prompt Engine</div>
+                <ModeControl value={promptMode} onChange={setPromptMode} />
+              </div>
+              
+              <div className="space-y-2">
+                <ControlSlider label="Max Tokens" value={maxNewTokens} min={1} max={512} step={1} onChange={setMaxNewTokens} />
+                <ControlSlider label="Temperature" value={temperature} min={0.1} max={2} step={0.1} onChange={setTemperature} />
+                <ControlSlider label="Top P" value={topP} min={0.1} max={1} step={0.05} onChange={setTopP} />
+                <ControlSlider label="Repetition Pen." value={repetitionPenalty} min={1} max={1.6} step={0.05} onChange={setRepetitionPenalty} />
+              </div>
+            </div>
+          </GlassPanel>
+
+          <GlassPanel title="System Telemetry" icon={Database}>
+            <div className="space-y-1">
+              <DetailRow label="Pipeline Node" value={checkpoint?.pipelineStep?.id || "N/A"} />
+              <DetailRow label="Evolution Step" value={checkpoint?.step ? `#${checkpoint.step}` : "N/A"} />
+              <DetailRow label="Sequence Depth" value={String(chatTurns)} />
+              <DetailRow label="Input Load" value={lastStats?.input_tokens ? `${lastStats.input_tokens} tok` : "N/A"} />
+              <DetailRow label="Compute Output" value={lastStats?.generated_tokens ? `${lastStats.generated_tokens} tok` : "N/A"} />
+              <DetailRow label="Hardware" value={lastStats?.device || "CPU/Auto"} />
+              <DetailRow 
+                label="Validation" 
+                value={checkpoint?.complete ? "Verified" : "Unfinished"} 
+                tone={checkpoint?.complete ? "text-emerald-400" : "text-amber-400"} 
+              />
+            </div>
+          </GlassPanel>
+
+          <GlassPanel 
+            title="Core Session" 
+            icon={Terminal}
+            action={
+              <button
+                type="button"
+                onClick={closeModel}
+                disabled={!canCloseModel}
+                className="flex h-8 items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 text-[10px] font-bold uppercase tracking-wider text-red-400 transition-colors hover:bg-red-500/20 hover:text-red-300 disabled:opacity-20 group"
+              >
+                {isClosing ? <Loader2 size={12} className="animate-spin" /> : <Power size={12} className="group-hover:rotate-12 transition-transform" />}
+                Unload Core
+              </button>
+            }
+          >
+            <div className="mb-4">
+              <button
+                type="button"
+                onClick={resetChat}
+                className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-white/5 bg-white/[0.02] text-[10px] font-bold uppercase tracking-wider text-white/50 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                <RotateCcw size={14} />
+                Purge Chat Buffer
+              </button>
+            </div>
+            <div className="h-40 overflow-y-auto rounded-2xl border border-white/5 bg-black/40 p-4 font-mono text-[10px] text-white/30 custom-scrollbar leading-relaxed shadow-inner">
+              {(status?.worker?.logs || []).length ? (
+                status.worker.logs.map((line, index) => (
+                  <div key={`${line}-${index}`} className="mb-1">
+                    <span className="text-white/10 mr-2">[{index.toString().padStart(3, '0')}]</span>
+                    {line}
+                  </div>
+                ))
+              ) : (
+                <div className="flex items-center gap-2 italic">
+                  <div className="h-1.5 w-1.5 rounded-full bg-white/20 animate-pulse" />
+                  No active logs in buffer.
+                </div>
+              )}
+            </div>
+          </GlassPanel>
+        </aside>
       </div>
     </main>
   );

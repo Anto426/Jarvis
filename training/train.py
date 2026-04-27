@@ -31,6 +31,8 @@ from training.paths import configure_cache_env, get_path
 
 
 INTERRUPT_REQUESTED = False
+JSON_WRITE_FAILURES = {}
+CONTROL_CACHE = {"checked_at": 0.0, "payload": None, "handled_save_request": None}
 
 
 def env_flag(name, default=False):
@@ -138,10 +140,38 @@ def utc_now_iso():
 
 
 def write_json_atomic(path, payload):
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+        f.flush()
+        os.fsync(f.fileno())
+
+    last_error = None
+    for attempt in range(40):
+        try:
+            tmp_path.replace(path)
+            return True
+        except OSError as exc:
+            is_windows_lock = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5
+            if not is_windows_lock:
+                raise
+            last_error = exc
+            time.sleep(min(0.05 * (attempt + 1), 1.0))
+
+    try:
+        tmp_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    key = str(path)
+    JSON_WRITE_FAILURES[key] = JSON_WRITE_FAILURES.get(key, 0) + 1
+    if JSON_WRITE_FAILURES[key] <= 3 or JSON_WRITE_FAILURES[key] % 20 == 0:
+        print(
+            f"Warning: metriche non aggiornate per lock Windows su {path}: {last_error}",
+            flush=True,
+        )
+    return False
 
 
 def console_print(message=""):
@@ -436,16 +466,17 @@ def cpu_optimizer_from_existing(raw_optimizer, train_cfg):
     return cpu_optimizer
 
 
-def replace_accelerator_optimizer(accelerator, old_optimizer, new_optimizer):
+def register_accelerator_optimizer(accelerator, old_optimizer, new_optimizer):
     optimizers = getattr(accelerator, "_optimizers", None)
     if optimizers is None:
         return
 
     accelerator._optimizers = [
-        new_optimizer if optimizer is old_optimizer else optimizer
+        optimizer
         for optimizer in optimizers
-        if optimizer is not new_optimizer
+        if optimizer is not old_optimizer and optimizer is not new_optimizer
     ]
+    accelerator._optimizers.append(new_optimizer)
 
 
 def bind_scheduler_to_optimizer(scheduler, optimizer):
@@ -472,7 +503,7 @@ def switch_to_cpu_optimizer(accelerator, optimizer, scheduler, train_cfg):
         cpu_optimizer,
         device_placement=False,
     )
-    replace_accelerator_optimizer(accelerator, optimizer, prepared_optimizer)
+    register_accelerator_optimizer(accelerator, optimizer, prepared_optimizer)
     bind_scheduler_to_optimizer(scheduler, prepared_optimizer)
 
     if torch.cuda.is_available():
@@ -659,13 +690,23 @@ def get_latest_checkpoint(checkpoint_dir):
     return checkpoints[0] if checkpoints else None
 
 
+def checkpoint_step_number(checkpoint):
+    try:
+        return int(checkpoint.name.split("_")[1])
+    except (IndexError, ValueError):
+        return -1
+
+
 def get_candidate_checkpoints(checkpoint_dir):
     if not checkpoint_dir.exists():
         return []
 
     checkpoints = [
         d for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.startswith("step_") and not (d / ".bad_checkpoint").exists()
+        if d.is_dir()
+        and d.name.startswith("step_")
+        and checkpoint_step_number(d) >= 0
+        and not (d / ".bad_checkpoint").exists()
     ]
 
     if not checkpoints:
@@ -673,20 +714,14 @@ def get_candidate_checkpoints(checkpoint_dir):
 
     checkpoints = sorted(
         checkpoints,
-        key=lambda x: int(x.name.split("_")[1]),
+        key=checkpoint_step_number,
         reverse=True,
     )
 
     valid_checkpoints = []
     for checkpoint in checkpoints:
-        has_model = (
-            (checkpoint / "pytorch_model.bin").exists()
-            or (checkpoint / "model.safetensors").exists()
-        )
-        has_training_state = (
-            (checkpoint / "optimizer.bin").exists()
-            and (checkpoint / "scheduler.bin").exists()
-        )
+        has_model = checkpoint_has_model(checkpoint)
+        has_training_state = checkpoint_has_full_training_state(checkpoint)
 
         if has_model and has_training_state:
             valid_checkpoints.append(checkpoint)
@@ -695,6 +730,46 @@ def get_candidate_checkpoints(checkpoint_dir):
         print(f"Checkpoint incompleto ignorato: {checkpoint}")
 
     return valid_checkpoints
+
+
+def get_resumable_checkpoints(checkpoint_dir):
+    if not checkpoint_dir.exists():
+        return []
+
+    checkpoints = [
+        d for d in checkpoint_dir.iterdir()
+        if d.is_dir()
+        and d.name.startswith("step_")
+        and checkpoint_step_number(d) >= 0
+        and not (d / ".bad_checkpoint").exists()
+    ]
+
+    checkpoints = sorted(
+        checkpoints,
+        key=checkpoint_step_number,
+        reverse=True,
+    )
+
+    return [checkpoint for checkpoint in checkpoints if checkpoint_has_model(checkpoint)]
+
+
+def checkpoint_has_model(checkpoint):
+    return (
+        (checkpoint / "pytorch_model.bin").exists()
+        or (checkpoint / "model.safetensors").exists()
+    )
+
+
+def checkpoint_has_full_training_state(checkpoint):
+    return (
+        checkpoint_has_model(checkpoint)
+        and (checkpoint / "optimizer.bin").exists()
+        and (checkpoint / "scheduler.bin").exists()
+    )
+
+
+def checkpoint_has_scheduler(checkpoint):
+    return (checkpoint / "scheduler.bin").exists()
 
 
 def checkpoint_meta_path(checkpoint):
@@ -751,6 +826,16 @@ def load_model_weights_from_checkpoint(model, checkpoint):
     }
 
 
+def load_scheduler_from_checkpoint(scheduler, checkpoint):
+    scheduler_path = checkpoint / "scheduler.bin"
+    if not scheduler_path.exists():
+        return False
+
+    state = torch.load(scheduler_path, map_location="cpu")
+    scheduler.load_state_dict(state)
+    return True
+
+
 def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints, pipeline_step=None):
     save_path = checkpoint_dir / f"step_{step}"
     tmp_path = checkpoint_dir / f"step_{step}.tmp"
@@ -768,6 +853,7 @@ def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints, pipeline
     rotate_checkpoints(checkpoint_dir, max_checkpoints)
 
     accelerator.print(f"\nCheckpoint salvato: {save_path}\n")
+    return save_path
 
 
 def checkpoint_due(global_step, last_saved_step, current_time, last_save_time, train_cfg):
@@ -986,6 +1072,45 @@ def request_stop():
     INTERRUPT_REQUESTED = True
 
 
+def dashboard_control(logs_dir):
+    now = time.time()
+    if now - CONTROL_CACHE["checked_at"] < 2.0:
+        return CONTROL_CACHE["payload"]
+
+    CONTROL_CACHE["checked_at"] = now
+    CONTROL_CACHE["payload"] = None
+    control_path = logs_dir / "training_control.json"
+    if not control_path.exists():
+        return None
+
+    try:
+        with control_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    action = str(payload.get("action", "")).strip().lower()
+    if action in {"save"}:
+        CONTROL_CACHE["payload"] = payload
+    return CONTROL_CACHE["payload"]
+
+
+def complete_dashboard_save_request(logs_dir, payload, step, checkpoint_path):
+    control_path = logs_dir / "training_control.json"
+    completed = {
+        **payload,
+        "action": "save_done",
+        "completed_at": utc_now_iso(),
+        "checkpoint_step": step,
+        "checkpoint_path": str(checkpoint_path),
+    }
+    try:
+        write_json_atomic(control_path, completed)
+    except OSError:
+        pass
+    CONTROL_CACHE["payload"] = completed
+
+
 def main():
 
     early_startup_banner()
@@ -1018,7 +1143,7 @@ def main():
     loaded_weights_checkpoint = None
     if restore_weights_only:
         loaded_previous_weights = False
-        for checkpoint in get_candidate_checkpoints(checkpoint_dir):
+        for checkpoint in get_resumable_checkpoints(checkpoint_dir):
             print(f"\nCarico solo i pesi modello da {checkpoint}\n")
             try:
                 result = load_model_weights_from_checkpoint(model, checkpoint)
@@ -1202,7 +1327,7 @@ def main():
         accelerator.print("\nNuovo stage: non ripristino optimizer, scheduler o global_step.\n")
     else:
         current_step_id = pipeline_step.get("id") if pipeline_step else None
-        for checkpoint in get_candidate_checkpoints(checkpoint_dir):
+        for checkpoint in get_resumable_checkpoints(checkpoint_dir):
             checkpoint_step_id = checkpoint_pipeline_step_id(checkpoint)
             if current_step_id and checkpoint_step_id and checkpoint_step_id != current_step_id:
                 accelerator.print(
@@ -1211,14 +1336,41 @@ def main():
                 )
                 continue
 
-            accelerator.print(f"\nRipristino stato completo da {checkpoint}\n")
+            if checkpoint_has_full_training_state(checkpoint):
+                accelerator.print(f"\nRipristino stato completo da {checkpoint}\n")
+                try:
+                    accelerator.load_state(str(checkpoint))
+                    global_step = checkpoint_step_number(checkpoint)
+                    restored_checkpoint = str(checkpoint)
+                    break
+                except Exception as exc:
+                    accelerator.print(f"Checkpoint non caricabile, lo salto: {checkpoint}")
+                    accelerator.print(f"Motivo: {exc}\n")
+                    if accelerator.is_main_process:
+                        marker = checkpoint / ".bad_checkpoint"
+                        marker.write_text(str(exc), encoding="utf-8")
+                    continue
+
+            accelerator.print(
+                f"\nCheckpoint senza optimizer.bin: ripristino pesi modello da {checkpoint} "
+                "e continuo con optimizer nuovo.\n"
+            )
             try:
-                accelerator.load_state(str(checkpoint))
-                global_step = int(checkpoint.name.split("_")[-1])
-                restored_checkpoint = str(checkpoint)
+                result = load_model_weights_from_checkpoint(accelerator.unwrap_model(model), checkpoint)
+                scheduler_loaded = load_scheduler_from_checkpoint(scheduler, checkpoint)
+                global_step = checkpoint_step_number(checkpoint)
+                restored_checkpoint = (
+                    f"{checkpoint} (pesi"
+                    f"{' + scheduler' if scheduler_loaded else ''}; optimizer reset)"
+                )
+                accelerator.print(
+                    "Resume parziale riuscito "
+                    f"(missing={result['missing']}, unexpected={result['unexpected']}, "
+                    f"scheduler_loaded={scheduler_loaded}).\n"
+                )
                 break
             except Exception as exc:
-                accelerator.print(f"Checkpoint non caricabile, lo salto: {checkpoint}")
+                accelerator.print(f"Checkpoint non caricabile come resume parziale, lo salto: {checkpoint}")
                 accelerator.print(f"Motivo: {exc}\n")
                 if accelerator.is_main_process:
                     marker = checkpoint / ".bad_checkpoint"
@@ -1482,16 +1634,29 @@ def main():
 
                         # CHECKPOINT
                         current_time = time.time()
-                        if checkpoint_due(
+                        control_payload = dashboard_control(logs_dir)
+                        save_request_id = None
+                        if control_payload and control_payload.get("action") == "save":
+                            save_request_id = str(
+                                control_payload.get("request_id")
+                                or control_payload.get("requested_at")
+                                or "manual"
+                            )
+                        save_requested = (
+                            save_request_id is not None
+                            and save_request_id != CONTROL_CACHE.get("handled_save_request")
+                        )
+                        due_checkpoint = checkpoint_due(
                             global_step,
                             last_saved_step,
                             current_time,
                             last_save_time,
                             train_cfg,
-                        ):
+                        )
+                        if save_requested or due_checkpoint:
                             if accelerator.is_main_process:
                                 checkpoint_started = time.time()
-                                save_checkpoint(
+                                saved_path = save_checkpoint(
                                     accelerator,
                                     global_step,
                                     checkpoint_dir,
@@ -1503,6 +1668,18 @@ def main():
                                     f"Checkpoint step {global_step} completato in "
                                     f"{format_duration(checkpoint_seconds)}.\n"
                                 )
+                                if save_requested:
+                                    complete_dashboard_save_request(
+                                        logs_dir,
+                                        control_payload,
+                                        global_step,
+                                        saved_path,
+                                    )
+                                    accelerator.print(
+                                        f"Checkpoint manuale dashboard salvato: {saved_path}\n"
+                                    )
+                            if save_requested:
+                                CONTROL_CACHE["handled_save_request"] = save_request_id
                             last_save_time = time.time()
                             last_saved_step = global_step
 

@@ -1,374 +1,556 @@
 "use client";
 
-import { useEffect, useMemo, useState, useRef, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   Activity,
-  Gauge,
-  LineChart as LineChartIcon,
-  Server,
-  Zap,
-  RefreshCcw,
-  LayoutDashboard,
+  ArrowRight,
+  Bot,
   Cpu,
   Database,
-  Terminal,
-  ShieldCheck,
-  Globe,
-  Clock,
-  ChevronRight,
+  Gauge,
+  LineChart as LineChartIcon,
+  MemoryStick,
   Monitor,
-  Box,
-  HardDrive,
-  Waves,
-  RotateCcw,
-  Activity as PulseIcon,
+  Pause,
+  Play,
+  RefreshCcw,
+  Save,
+  Zap,
 } from "lucide-react";
-import { CartesianGrid, Area, AreaChart, XAxis, YAxis, ResponsiveContainer, Tooltip } from "recharts";
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  ReferenceArea,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 import { Badge } from "@/components/ui/badge";
 
-/* --- Hooks --- */
-
-function useMediaQuery(query) {
-  const [matches, setMatches] = useState(false);
-  useEffect(() => {
-    const media = window.matchMedia(query);
-    const update = () => setMatches(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, [query]);
-  return matches;
-}
-
-function useClientClock() {
-  const [time, setTime] = useState(null);
-
-  useEffect(() => {
-    const update = () => setTime(new Date().toLocaleTimeString());
-    const initial = setTimeout(update, 0);
-    const timer = setInterval(update, 1000);
-
-    return () => {
-      clearTimeout(initial);
-      clearInterval(timer);
-    };
-  }, []);
-
-  return time || "--:--:--";
-}
-
-function numericOrNull(value) {
+function numberOrNull(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
-function pushSeries(series, value, size = 40) {
-  return [...series.slice(-(size - 1)), numericOrNull(value)];
+function formatFixed(value, digits = 1) {
+  const number = numberOrNull(value);
+  return number === null ? "-" : number.toFixed(digits);
 }
 
-function emptySeries(size = 40) {
-  return Array.from({ length: size }, () => null);
-}
-
-function emptyTelemetrySeries() {
-  return {
-    cpu: emptySeries(),
-    gpu: emptySeries(),
-    vram: emptySeries(),
-    ram: emptySeries(),
-    disk: emptySeries(),
-    power: emptySeries(),
-  };
-}
-
-function appendSystemTelemetry(previousSeries, payload) {
-  const base = previousSeries || emptyTelemetrySeries();
-  const system = payload.system || {};
-  const history = Array.isArray(payload.history) ? payload.history : [];
-  const latestMetric = payload.current?.loss !== undefined ? payload.current : (history[history.length - 1] || {});
-
-  return {
-    cpu: pushSeries(base.cpu || emptySeries(), system.cpu_percent),
-    gpu: pushSeries(base.gpu || emptySeries(), system.gpu_util_percent),
-    vram: pushSeries(base.vram || emptySeries(), system.gpu_memory_used_gb ?? latestMetric.vram_reserved_gb ?? latestMetric.vram_allocated_gb),
-    ram: pushSeries(base.ram || emptySeries(), system.ram_percent),
-    disk: pushSeries(base.disk || emptySeries(), system.disk_percent),
-    power: pushSeries(base.power || emptySeries(), system.gpu_power_w),
-  };
-}
-
-/* --- Formatting --- */
-
-function formatNumber(value, digits = 4) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
-  return Number(value).toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+function formatLoss(value) {
+  const number = numberOrNull(value);
+  return number === null ? "-" : number.toFixed(4);
 }
 
 function formatCompact(value) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
-  return Number(value).toExponential(2);
-}
-
-function formatFixed(value, digits = 1) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  return number.toFixed(digits);
+  const number = numberOrNull(value);
+  return number === null ? "-" : number.toExponential(2);
 }
 
 function formatGb(value, digits = 1) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  return `${number.toFixed(digits)}GB`;
+  const number = numberOrNull(value);
+  return number === null ? "-" : `${number.toFixed(digits)} GB`;
 }
 
-function formatUnit(value, unit, digits = 1) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  return `${number.toFixed(digits)}${unit}`;
+function formatUnit(value, unit, digits = 0) {
+  const number = numberOrNull(value);
+  return number === null ? "-" : `${number.toFixed(digits)}${unit}`;
 }
 
-function metricLabel(dataKey) {
-  const labels = {
-    trainLoss: "Train loss",
-    evalLoss: "Eval loss",
-    learningRate: "Learning rate",
-  };
-
-  return labels[dataKey] || dataKey;
+function formatTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString();
 }
 
-function formatMetricTooltipValue(dataKey, value) {
-  if (dataKey === "learningRate") {
-    return formatCompact(value);
+function formatDuration(seconds) {
+  const value = numberOrNull(seconds);
+  if (value === null || value <= 0) return "-";
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function formatSigned(value, digits = 1, suffix = "") {
+  const number = numberOrNull(value);
+  if (number === null) return "-";
+  const sign = number > 0 ? "+" : "";
+  return `${sign}${number.toFixed(digits)}${suffix}`;
+}
+
+function formatInteger(value) {
+  const number = numberOrNull(value);
+  return number === null ? "-" : Math.round(number).toLocaleString("it-IT");
+}
+
+function metricRows(history) {
+  const rows = new Map();
+  for (const item of Array.isArray(history) ? history : []) {
+    if (!item?.global_step) continue;
+    const step = Number(item.global_step);
+    const row = rows.get(step) || { step };
+    if (item.type === "train") {
+      row.trainLoss = numberOrNull(item.loss);
+      row.perplexity = numberOrNull(item.perplexity);
+      row.learningRate = numberOrNull(item.learning_rate);
+    }
+    if (item.type === "eval") {
+      row.evalLoss = numberOrNull(item.loss);
+      row.evalPerplexity = numberOrNull(item.perplexity);
+    }
+    rows.set(step, row);
+  }
+  return Array.from(rows.values()).sort((a, b) => a.step - b.step);
+}
+
+function latestFrom(data) {
+  const history = Array.isArray(data.history) ? data.history : [];
+  return data.current?.loss !== undefined ? data.current : history[history.length - 1] || {};
+}
+
+function computeEta(history, currentStep, totalSteps) {
+  const rows = (Array.isArray(history) ? history : [])
+    .filter((item) => item?.timestamp && item?.global_step)
+    .slice(-30);
+
+  if (rows.length < 2 || !totalSteps || currentStep >= totalSteps) return null;
+
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const seconds = (new Date(last.timestamp).getTime() - new Date(first.timestamp).getTime()) / 1000;
+  const steps = Number(last.global_step) - Number(first.global_step);
+  if (seconds <= 0 || steps <= 0) return null;
+  return ((totalSteps - currentStep) / steps) * seconds;
+}
+
+function average(values) {
+  const clean = values.filter((value) => Number.isFinite(Number(value)));
+  if (!clean.length) return null;
+  return clean.reduce((sum, value) => sum + Number(value), 0) / clean.length;
+}
+
+function standardDeviation(values) {
+  const avg = average(values);
+  if (avg === null) return null;
+  const clean = values.filter((value) => Number.isFinite(Number(value)));
+  const variance = average(clean.map((value) => (Number(value) - avg) ** 2));
+  return variance === null ? null : Math.sqrt(variance);
+}
+
+function movingAverageRows(rows, windowSize) {
+  const window = Math.max(1, Number(windowSize) || 1);
+  return rows.map((row, index) => {
+    const start = Math.max(0, index - window + 1);
+    const subset = rows.slice(start, index + 1);
+    return {
+      ...row,
+      trainLossSmooth: average(subset.map((item) => item.trainLoss)),
+      perplexitySmooth: average(subset.map((item) => item.perplexity)),
+      learningRateSmooth: average(subset.map((item) => item.learningRate)),
+    };
+  });
+}
+
+function computeAnalysis(history, rows, currentStep, totalSteps) {
+  const trainRows = rows.filter((row) => Number.isFinite(Number(row.trainLoss)));
+  const recent = trainRows.slice(-120);
+  const previous = trainRows.slice(-240, -120);
+  const recentAvg = average(recent.map((row) => row.trainLoss));
+  const previousAvg = average(previous.map((row) => row.trainLoss));
+  const trendPct =
+    recentAvg !== null && previousAvg !== null && previousAvg !== 0
+      ? ((recentAvg - previousAvg) / previousAvg) * 100
+      : null;
+  const volatility = standardDeviation(recent.map((row) => row.trainLoss));
+  const best = trainRows.reduce((bestRow, row) => {
+    if (!bestRow || row.trainLoss < bestRow.trainLoss) return row;
+    return bestRow;
+  }, null);
+
+  const timed = (Array.isArray(history) ? history : [])
+    .filter((item) => item?.timestamp && item?.global_step && item.type === "train")
+    .slice(-80);
+  let stepsPerMinute = null;
+  if (timed.length >= 2) {
+    const first = timed[0];
+    const last = timed[timed.length - 1];
+    const seconds = (new Date(last.timestamp).getTime() - new Date(first.timestamp).getTime()) / 1000;
+    const steps = Number(last.global_step) - Number(first.global_step);
+    if (seconds > 0 && steps > 0) stepsPerMinute = (steps / seconds) * 60;
   }
 
-  return formatNumber(value);
+  const latestEval = [...rows].reverse().find((row) => Number.isFinite(Number(row.evalLoss)));
+  const trainNearEval = latestEval
+    ? [...trainRows].reverse().find((row) => row.step <= latestEval.step)
+    : null;
+  const evalGap =
+    latestEval && trainNearEval && Number.isFinite(Number(trainNearEval.trainLoss))
+      ? latestEval.evalLoss - trainNearEval.trainLoss
+      : null;
+
+  let verdict = "raccolgo dati";
+  if (trendPct !== null) {
+    if (trendPct < -3) verdict = "in miglioramento";
+    else if (trendPct > 3) verdict = "peggiora";
+    else verdict = "stabile";
+  }
+  if (volatility !== null && volatility > 0.85) verdict += " / rumoroso";
+
+  return {
+    recentAvg,
+    previousAvg,
+    trendPct,
+    volatility,
+    bestLoss: best?.trainLoss,
+    bestStep: best?.step,
+    stepsPerMinute,
+    evalGap,
+    etaSeconds: computeEta(history, currentStep, totalSteps),
+    verdict,
+  };
 }
 
-/* --- Components --- */
+function linearTrend(rows, key) {
+  const points = rows
+    .map((row) => ({ x: Number(row.step), y: numberOrNull(row[key]) }))
+    .filter((point) => Number.isFinite(point.x) && point.y !== null);
+  if (points.length < 2) return { slope: null, projectedDelta: null, projectedPct: null };
 
-function ZoomMinimap({ data, dataKey, domain, onDomainChange, color }) {
-  const containerRef = useRef(null);
-  const dragging = useRef(null);
-  const steps = useMemo(() => data.map((d) => d.step), [data]);
-  const minStep = steps[0] ?? 0;
-  const maxStep = steps[steps.length - 1] ?? 1;
-  const range = maxStep - minStep || 1;
-  const selLeft = domain ? (domain[0] - minStep) / range : 0;
-  const selRight = domain ? (domain[1] - minStep) / range : 1;
+  const xAvg = average(points.map((point) => point.x));
+  const yAvg = average(points.map((point) => point.y));
+  const denominator = points.reduce((sum, point) => sum + (point.x - xAvg) ** 2, 0);
+  if (!denominator) return { slope: null, projectedDelta: null, projectedPct: null };
 
-  const startDrag = (type, e) => {
-    e.preventDefault();
-    dragging.current = type;
-    document.body.style.cursor = "ew-resize";
+  const numerator = points.reduce((sum, point) => sum + (point.x - xAvg) * (point.y - yAvg), 0);
+  const slope = numerator / denominator;
+  const span = points[points.length - 1].x - points[0].x;
+  const projectedDelta = slope * span;
+  const projectedPct = points[0].y !== 0 ? (projectedDelta / points[0].y) * 100 : null;
+  return { slope, projectedDelta, projectedPct };
+}
+
+function computePeriodAnalysis(history, rows, domain) {
+  const left = domain ? Math.min(Number(domain[0]), Number(domain[1])) : -Infinity;
+  const right = domain ? Math.max(Number(domain[0]), Number(domain[1])) : Infinity;
+  const inRange = (step) => Number.isFinite(Number(step)) && Number(step) >= left && Number(step) <= right;
+  const scopedRows = rows.filter((row) => inRange(row.step));
+  const trainRows = scopedRows.filter((row) => Number.isFinite(Number(row.trainLoss)));
+  if (!trainRows.length) return null;
+
+  const first = trainRows[0];
+  const last = trainRows[trainRows.length - 1];
+  const losses = trainRows.map((row) => row.trainLoss);
+  const avgLoss = average(losses);
+  const volatility = standardDeviation(losses);
+  const best = trainRows.reduce((bestRow, row) => (row.trainLoss < bestRow.trainLoss ? row : bestRow), trainRows[0]);
+  const worst = trainRows.reduce((worstRow, row) => (row.trainLoss > worstRow.trainLoss ? row : worstRow), trainRows[0]);
+  const deltaLoss = last.trainLoss - first.trainLoss;
+  const deltaPct = first.trainLoss !== 0 ? (deltaLoss / first.trainLoss) * 100 : null;
+  const trend = linearTrend(trainRows, "trainLoss");
+  const movement = trend.projectedPct ?? deltaPct;
+  const noiseRatio = avgLoss ? (volatility || 0) / avgLoss : 0;
+
+  let behavior = "stabile";
+  if (movement !== null) {
+    if (movement < -5) behavior = "migliora netto";
+    else if (movement < -1) behavior = "migliora leggero";
+    else if (movement > 5) behavior = "peggiora netto";
+    else if (movement > 1) behavior = "peggiora leggero";
+  }
+  if (noiseRatio > 0.12) behavior += " / instabile";
+
+  const rawTrain = (Array.isArray(history) ? history : [])
+    .filter((item) => item?.type === "train" && inRange(item.global_step))
+    .sort((a, b) => Number(a.global_step) - Number(b.global_step));
+  const timed = rawTrain.filter((item) => item.timestamp);
+  let durationSeconds = null;
+  let stepsPerMinute = null;
+  if (timed.length >= 2) {
+    const startTime = new Date(timed[0].timestamp).getTime();
+    const endTime = new Date(timed[timed.length - 1].timestamp).getTime();
+    const stepSpan = Number(timed[timed.length - 1].global_step) - Number(timed[0].global_step);
+    durationSeconds = (endTime - startTime) / 1000;
+    if (durationSeconds > 0 && stepSpan > 0) stepsPerMinute = (stepSpan / durationSeconds) * 60;
+  }
+
+  const tokens = rawTrain.map((item) => numberOrNull(item.tokens)).filter((value) => value !== null);
+  const throughput = rawTrain
+    .map((item) => numberOrNull(item.tokens_per_second ?? item.tokens_per_sec ?? item.tok_per_sec ?? item.tok_s))
+    .filter((value) => value !== null);
+  const evalRows = scopedRows.filter((row) => Number.isFinite(Number(row.evalLoss)));
+  const latestEval = evalRows[evalRows.length - 1];
+  const trainNearEval = latestEval ? [...trainRows].reverse().find((row) => row.step <= latestEval.step) : null;
+  const evalGap =
+    latestEval && trainNearEval && Number.isFinite(Number(trainNearEval.trainLoss))
+      ? latestEval.evalLoss - trainNearEval.trainLoss
+      : null;
+  const lrFirst = trainRows.find((row) => Number.isFinite(Number(row.learningRate)));
+  const lrLast = [...trainRows].reverse().find((row) => Number.isFinite(Number(row.learningRate)));
+  const cpuOptimizerShare = rawTrain.length
+    ? (rawTrain.filter((item) => item.cpu_optimizer_active === true).length / rawTrain.length) * 100
+    : null;
+
+  return {
+    startStep: first.step,
+    endStep: last.step,
+    points: trainRows.length,
+    behavior,
+    firstLoss: first.trainLoss,
+    lastLoss: last.trainLoss,
+    deltaLoss,
+    deltaPct,
+    trendPct: trend.projectedPct,
+    avgLoss,
+    volatility,
+    bestLoss: best.trainLoss,
+    bestStep: best.step,
+    worstLoss: worst.trainLoss,
+    worstStep: worst.step,
+    avgPerplexity: average(trainRows.map((row) => row.perplexity)),
+    lrStart: lrFirst?.learningRate,
+    lrEnd: lrLast?.learningRate,
+    durationSeconds,
+    stepsPerMinute,
+    tokensAvg: average(tokens),
+    tokensTotal: tokens.length ? tokens.reduce((sum, value) => sum + value, 0) : null,
+    throughputAvg: average(throughput),
+    evalCount: evalRows.length,
+    evalGap,
+    cpuOptimizerShare,
   };
+}
+
+function clampDomain(domain, rows) {
+  if (!domain || !rows.length) return null;
+  const minStep = rows[0].step;
+  const maxStep = rows[rows.length - 1].step;
+  const left = Math.max(minStep, Math.min(maxStep, Number(domain[0])));
+  const right = Math.max(minStep, Math.min(maxStep, Number(domain[1])));
+  if (!Number.isFinite(left) || !Number.isFinite(right) || left >= right) return null;
+  return [left, right];
+}
+
+function Panel({ title, icon: Icon, action, children, className = "" }) {
+  return (
+    <section className={`relative rounded-3xl border border-white/5 bg-white/[0.02] backdrop-blur-md overflow-hidden ${className}`}>
+      <div className="relative flex flex-col sm:flex-row sm:min-h-14 items-start sm:items-center justify-between border-b border-white/5 px-6 py-4 gap-4">
+        <div className="flex items-center gap-3">
+          {Icon ? <Icon size={18} className="text-white/50" /> : null}
+          <h2 className="text-xs font-bold uppercase tracking-wider text-white/80">{title}</h2>
+        </div>
+        {action && <div className="flex items-center gap-2">{action}</div>}
+      </div>
+      <div className="relative p-6">{children}</div>
+    </section>
+  );
+}
+
+function HeaderInfo({ label, value }) {
+  return (
+    <div className="min-w-0 rounded-2xl border border-white/5 bg-white/[0.02] px-5 py-3.5 transition-colors duration-300 hover:bg-white/5">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-white/40">{label}</div>
+      <div className="mt-1 truncate text-sm font-bold text-white/90">{value || "-"}</div>
+    </div>
+  );
+}
+
+function MetricTile({ icon: Icon, label, value, sub }) {
+  return (
+    <div className="group relative overflow-hidden rounded-3xl border border-white/5 bg-white/[0.02] backdrop-blur-md p-6 transition-colors duration-300 hover:bg-white/[0.04]">
+      <div className="relative z-10 flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2.5">
+          <Icon size={16} className="text-white/40" />
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-white/50">{label}</span>
+        </div>
+      </div>
+      <div className="relative z-10 text-3xl sm:text-4xl font-bold tracking-tight text-white">{value}</div>
+      {sub ? <div className="relative z-10 mt-2 text-xs font-medium text-white/40">{sub}</div> : null}
+    </div>
+  );
+}
+
+function ResourceRow({ icon: Icon, label, value, sub, percent, tone = "bg-white", glowColor = "transparent" }) {
+  const width = Math.max(0, Math.min(100, Number.isFinite(percent) ? percent : 0));
+  return (
+    <div className="group py-2.5">
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="flex items-center gap-2.5">
+          <Icon size={16} className="text-white/40 group-hover:text-white/60 transition-colors" />
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-white/50 group-hover:text-white/70 transition-colors">{label}</span>
+        </div>
+        <div className="text-right">
+          <span className="text-xs font-bold text-white/90">{value}</span>
+          {sub && <span className="ml-2 text-[10px] font-medium text-white/40">{sub}</span>}
+        </div>
+      </div>
+      <div className="relative h-1.5 rounded-full bg-black/40 shadow-inner overflow-hidden border border-white/5">
+        <div 
+          className={`absolute top-0 left-0 h-full rounded-full ${tone} transition-all duration-1000 shadow-[0_0_10px_rgba(255,255,255,0.3)]`} 
+          style={{ width: `${width}%` }} 
+        />
+      </div>
+    </div>
+  );
+}
+
+function DetailRow({ label, value, highlight = false }) {
+  return (
+    <div className="flex items-center justify-between gap-4 border-b border-white/5 py-3 last:border-b-0 group">
+      <span className="text-[11px] font-semibold uppercase tracking-wider text-white/40 group-hover:text-white/60 transition-colors">{label}</span>
+      <span className={`text-right text-xs font-medium ${highlight ? "text-white" : "text-white/70"}`}>{value || "-"}</span>
+    </div>
+  );
+}
+
+function SmallButton({ children, onClick, active = false, disabled = false }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`h-7 rounded-md border px-3 text-[10px] font-bold uppercase tracking-wider transition-all duration-300 ${
+        disabled
+          ? "cursor-not-allowed border-transparent bg-transparent text-white/20"
+          : active
+            ? "border-white/20 bg-white/10 text-white shadow-[0_0_15px_rgba(255,255,255,0.1)]"
+            : "border-transparent bg-transparent text-white/50 hover:bg-white/5 hover:text-white"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ZoomStrip({ rows, domain, onDomainChange }) {
+  const ref = useRef(null);
+  const dragging = useRef(null);
+  const minStep = rows[0]?.step ?? 0;
+  const maxStep = rows[rows.length - 1]?.step ?? 1;
+  const range = Math.max(1, maxStep - minStep);
+  const effective = useMemo(() => domain || [minStep, maxStep], [domain, minStep, maxStep]);
+  const leftPct = ((effective[0] - minStep) / range) * 100;
+  const rightPct = ((effective[1] - minStep) / range) * 100;
+
+  const stepFromEvent = useCallback(
+    (event) => {
+      const rect = ref.current?.getBoundingClientRect();
+      if (!rect) return null;
+      const clientX = event.touches?.[0]?.clientX ?? event.clientX;
+      const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return minStep + percent * range;
+    },
+    [minStep, range]
+  );
 
   useEffect(() => {
-    const handleMove = (e) => {
-      if (!dragging.current || !containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-      const frac = Math.max(0, Math.min(1, x / rect.width));
-      const s = minStep + frac * range;
-      if (dragging.current === "left") onDomainChange([Math.min(s, (domain?.[1] || maxStep) - range * 0.01), domain?.[1] || maxStep]);
-      if (dragging.current === "right") onDomainChange([domain?.[0] || minStep, Math.max(s, (domain?.[0] || minStep) + range * 0.01)]);
+    const onMove = (event) => {
+      if (!dragging.current) return;
+      const step = stepFromEvent(event);
+      if (step === null) return;
+      const minWidth = Math.max(10, range * 0.02);
+      if (dragging.current === "left") {
+        onDomainChange([Math.min(step, effective[1] - minWidth), effective[1]]);
+      } else if (dragging.current === "right") {
+        onDomainChange([effective[0], Math.max(step, effective[0] + minWidth)]);
+      } else {
+        const width = effective[1] - effective[0];
+        const nextLeft = Math.max(minStep, Math.min(maxStep - width, step - width / 2));
+        onDomainChange([nextLeft, nextLeft + width]);
+      }
     };
-    const stop = () => { dragging.current = null; document.body.style.cursor = ""; };
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", stop);
+    const onUp = () => {
+      dragging.current = null;
+      document.body.style.cursor = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
     return () => {
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", stop);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
     };
-  }, [domain, minStep, range, maxStep, onDomainChange]);
+  }, [effective, maxStep, minStep, onDomainChange, range, stepFromEvent]);
+
+  if (rows.length < 2) return null;
 
   return (
-    <div ref={containerRef} className="relative mt-10 h-3 bg-white/[0.02] rounded-full border border-white/5 overflow-visible">
-      {domain && (
-        <>
-          <div className="absolute inset-y-0 bg-white/5 rounded-full border-x border-white/10" style={{ left: `${selLeft * 100}%`, right: `${(1 - selRight) * 100}%` }} />
-          <div className="absolute top-1/2 -translate-y-1/2 size-7 bg-white rounded-xl cursor-ew-resize -translate-x-1/2 shadow-xl border-4 border-black" style={{ left: `${selLeft * 100}%` }} onMouseDown={(e) => startDrag("left", e)} />
-          <div className="absolute top-1/2 -translate-y-1/2 size-7 bg-white rounded-xl cursor-ew-resize -translate-x-1/2 shadow-xl border-4 border-black" style={{ left: `${selRight * 100}%` }} onMouseDown={(e) => startDrag("right", e)} />
-        </>
-      )}
-      {!domain && (
-        <div className="absolute inset-0 cursor-pointer flex items-center justify-center group/init" onClick={() => onDomainChange([minStep, maxStep])}>
-           <span className="text-[8px] font-black uppercase tracking-[0.4em] text-white/10 group-hover/init:text-white/40 transition-colors">Initialize Zoom Controller</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function StatusBar({ vram, vramTotal, status }) {
-  const clock = useClientClock();
-  const vramText = Number.isFinite(Number(vram))
-    ? `${Number(vram).toFixed(1)}GB${Number.isFinite(Number(vramTotal)) ? ` / ${Number(vramTotal).toFixed(1)}GB` : ""}`
-    : "-";
-
-  return (
-    <div className="w-full bg-white/[0.02] border-b border-white/[0.05] py-2 px-6 sm:px-10 flex items-center justify-between text-[9px] font-black uppercase tracking-[0.2em] text-white/30 backdrop-blur-3xl">
-      <div className="flex items-center gap-8">
-        <div className="flex items-center gap-2.5">
-          <div className="size-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_10px_#10b981]" />
-          <span className="text-white/50">Core Sync: {status || "waiting"}</span>
-        </div>
-        <div className="hidden md:flex items-center gap-2">
-          <Globe size={10} className="text-white/10" />
-          <span>Jarvis-Protocol-01</span>
-        </div>
+    <div className="mt-6">
+      <div
+        ref={ref}
+        className="relative h-4 rounded-full border border-white/10 bg-black/40 shadow-inner cursor-pointer"
+        onMouseDown={(event) => {
+          dragging.current = "move";
+          document.body.style.cursor = "ew-resize";
+          const step = stepFromEvent(event);
+          if (step !== null) {
+            const width = effective[1] - effective[0];
+            const nextLeft = Math.max(minStep, Math.min(maxStep - width, step - width / 2));
+            onDomainChange([nextLeft, nextLeft + width]);
+          }
+        }}
+      >
+        <div
+          className="absolute inset-y-0 rounded-full bg-gradient-to-r from-white/10 via-white/30 to-white/10 shadow-[0_0_10px_rgba(255,255,255,0.15)] transition-all duration-75"
+          style={{ left: `${leftPct}%`, width: `${Math.max(2, rightPct - leftPct)}%` }}
+        />
+        <button
+          type="button"
+          className="absolute top-1/2 h-5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/20 bg-white shadow-[0_0_10px_rgba(255,255,255,0.8)] flex items-center justify-center hover:scale-110 transition-transform"
+          style={{ left: `${leftPct}%` }}
+          onMouseDown={(event) => {
+            event.stopPropagation();
+            dragging.current = "left";
+            document.body.style.cursor = "ew-resize";
+          }}
+        >
+          <div className="w-0.5 h-2.5 bg-black/30 rounded-full" />
+        </button>
+        <button
+          type="button"
+          className="absolute top-1/2 h-5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/20 bg-white shadow-[0_0_10px_rgba(255,255,255,0.8)] flex items-center justify-center hover:scale-110 transition-transform"
+          style={{ left: `${rightPct}%` }}
+          onMouseDown={(event) => {
+            event.stopPropagation();
+            dragging.current = "right";
+            document.body.style.cursor = "ew-resize";
+          }}
+        >
+          <div className="w-0.5 h-2.5 bg-black/30 rounded-full" />
+        </button>
       </div>
-      <div className="flex items-center gap-8">
-        <div className="flex items-center gap-2 font-mono">
-          <Monitor size={10} className="text-white/10" />
-          <span className="text-white/40">VRAM: {vramText}</span>
-        </div>
-        <div className="flex items-center gap-2 font-mono">
-          <Clock size={10} className="text-white/10" />
-          <span className="text-white/40">{clock}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function PageHeader({ eyebrow, title, badge, actions }) {
-  return (
-    <div className="mb-12 admin-fade-up sticky top-0 z-20 bg-background/20 backdrop-blur-3xl py-6 border-b border-white/[0.03] -mx-6 px-6 sm:-mx-10 sm:px-10 group/header">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 w-full">
-        <div className="flex items-center gap-6">
-           <div className="size-12 rounded-2xl bg-white flex items-center justify-center text-black shadow-xl">
-              <Cpu size={24} />
-           </div>
-           <div>
-            <p className="text-[9px] text-white/15 font-black uppercase tracking-[0.4em] mb-1">{eyebrow}</p>
-            <div className="flex items-center gap-4">
-              <h1 className="text-4xl font-black tracking-tighter text-white text-glow leading-none">{title}</h1>
-              {badge}
-            </div>
-           </div>
-        </div>
-        {actions && <div className="flex items-center gap-4">{actions}</div>}
+      <div className="mt-2.5 flex justify-between text-[10px] font-bold text-white/40 px-1">
+        <span>{Math.round(effective[0])}</span>
+        <span>{Math.round(effective[1])}</span>
       </div>
     </div>
   );
 }
 
-function TelemetryCard({ label, value, unit, data, color = "#FFFFFF", icon: Icon, domain = [0, 100] }) {
-  const chartData = (Array.isArray(data) ? data : []).map(v => ({ v: numericOrNull(v) }));
-
-  return (
-    <div className="glass-card rounded-[1.5rem] p-5 border border-white/[0.04] relative overflow-hidden group/tel">
-      <div className="relative z-10 flex flex-col justify-between h-full">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2.5">
-             <div className="p-1.5 rounded-lg bg-white/[0.02] text-white/20 group-hover/tel:text-white transition-colors">
-                <Icon size={14} />
-             </div>
-             <span className="text-[9px] font-black uppercase tracking-[0.15em] text-white/20">{label}</span>
-          </div>
-          <span className="text-xl font-black tabular-nums tracking-tighter text-white/80">{value}<span className="text-[9px] text-white/20 ml-1 uppercase">{unit}</span></span>
-        </div>
-        <div className="h-10 w-full -mb-1">
-           <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                 <YAxis domain={domain} hide />
-                 <Area type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} fill={color} fillOpacity={0.05} isAnimationActive={false} />
-              </AreaChart>
-           </ResponsiveContainer>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function MetricCard({ label, value, icon: Icon, caption, trend, data, dataKey, smoothing, onSmoothingChange }) {
-  return (
-    <div className="surface-elevated rounded-[2rem] p-6 transition-all hover:translate-y-[-4px] admin-fade-up group relative overflow-hidden">
-      <div className="relative z-10">
-        <div className="flex items-start justify-between mb-4">
-          <div className="p-4 rounded-2xl bg-white/[0.03] border border-white/[0.06] group-hover:bg-white group-hover:text-black transition-all duration-500">
-            <Icon size={22} />
-          </div>
-          {onSmoothingChange && (
-             <div className="flex items-center gap-2.5 bg-black/40 px-3 py-1.5 rounded-xl border border-white/5 opacity-0 group-hover:opacity-100 transition-all backdrop-blur-xl">
-               <input type="range" min="1" max="50" value={smoothing} onChange={(e) => onSmoothingChange(parseInt(e.target.value))} className="w-12 accent-white h-1 bg-white/5 rounded-full appearance-none cursor-pointer" />
-               <span className="text-[9px] font-black tabular-nums text-white/40">{smoothing}</span>
-             </div>
-          )}
-        </div>
-        <div className="space-y-1">
-          <p className="text-[10px] font-black uppercase tracking-[0.3em] text-white/15">{label}</p>
-          <h3 className="text-4xl font-black tabular-nums text-white tracking-tighter text-glow">{value}</h3>
-        </div>
-      </div>
-      {data && data.length > 1 && (
-        <div className="absolute inset-x-0 bottom-0 h-24 opacity-5 pointer-events-none group-hover:opacity-15 transition-opacity duration-1000">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data}>
-              <Area type="monotone" dataKey={dataKey} stroke="#FFFFFF" strokeWidth={2} fill="#FFFFFF" fillOpacity={0.1} isAnimationActive={false} />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SurfaceCard({ title, description, children, badge, className = "" }) {
-  return (
-    <div className={`surface-elevated rounded-[2.5rem] admin-fade-up group/card ${className}`}>
-      <div className="px-10 py-7 border-b border-white/[0.04] flex items-center justify-between relative z-10">
-        <div className="flex items-center gap-4">
-          <div className="size-3 rounded-full bg-white shadow-[0_0_15px_rgba(255,255,255,0.6)] animate-pulse" />
-          <div>
-            <h2 className="text-xs font-black uppercase tracking-[0.4em] text-white/80">{title}</h2>
-            {description && <p className="text-[9px] font-bold text-white/10 uppercase tracking-widest mt-1">{description}</p>}
-          </div>
-        </div>
-        {badge}
-      </div>
-      <div className={`p-10 relative z-10 ${className.includes('flex-col') ? 'flex-1 flex flex-col' : ''}`}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function SummaryRow({ label, value, colorClass = "text-white", icon: Icon }) {
-  return (
-    <div className="flex items-center justify-between py-5 border-b border-white/[0.02] last:border-0 group/row">
-      <div className="flex items-center gap-5">
-        <div className="size-10 rounded-xl bg-white/[0.02] border border-white/[0.05] flex items-center justify-center group-hover/row:bg-white group-hover/row:text-black transition-all duration-500 shadow-xl">
-          {Icon && <Icon size={16} />}
-        </div>
-        <span className="text-[10px] font-black text-white/20 uppercase tracking-[0.3em]">{label}</span>
-      </div>
-      <span className={`text-lg font-black tabular-nums tracking-tighter ${colorClass}`}>{value}</span>
-    </div>
-  );
-}
-
-function ChartTooltip({ active, label, payload }) {
+function ChartTooltip({ active, payload, label }) {
   const rows = (payload || []).filter((item) => Number.isFinite(Number(item.value)));
-
-  if (!active || rows.length === 0) {
-    return null;
-  }
+  if (!active || rows.length === 0) return null;
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-black/95 px-5 py-4 shadow-2xl backdrop-blur-xl">
-      <div className="mb-3 flex items-center justify-between gap-8 border-b border-white/5 pb-3">
-        <span className="text-[9px] font-black uppercase tracking-[0.3em] text-white/20">Step</span>
-        <span className="font-mono text-xs font-black tabular-nums text-white">{label ?? rows[0]?.payload?.step ?? "-"}</span>
+    <div className="rounded-2xl border border-white/10 bg-black/80 backdrop-blur-xl px-5 py-4 shadow-xl">
+      <div className="mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
+        <div className="h-2 w-2 rounded-full bg-white animate-pulse" />
+        <div className="text-[10px] font-bold uppercase tracking-wider text-white/70">
+          Step {label}
+        </div>
       </div>
       <div className="space-y-2">
         {rows.map((item) => (
-          <div key={item.dataKey} className="flex items-center justify-between gap-8">
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-white/30">{metricLabel(item.dataKey)}</span>
-            <span className="font-mono text-sm font-black tabular-nums text-white">{formatMetricTooltipValue(item.dataKey, item.value)}</span>
+          <div key={item.dataKey} className="flex items-center justify-between gap-8 text-[11px]">
+            <div className="flex items-center gap-2">
+              <div className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: item.stroke || item.fill || "white" }} />
+              <span className="font-semibold text-white/60">{item.name || item.dataKey}</span>
+            </div>
+            <span className="font-mono font-bold text-white">{formatFixed(item.value, item.dataKey === "learningRate" ? 8 : 4)}</span>
           </div>
         ))}
       </div>
@@ -376,38 +558,221 @@ function ChartTooltip({ active, label, payload }) {
   );
 }
 
-/* --- Main View --- */
+function chartStep(state) {
+  return numberOrNull(state?.activeLabel ?? state?.activePayload?.[0]?.payload?.step);
+}
+
+function HighlightArea({ domain }) {
+  const left = numberOrNull(domain?.[0]);
+  const right = numberOrNull(domain?.[1]);
+  if (left === null || right === null || left === right) return null;
+  return (
+    <ReferenceArea
+      x1={Math.min(left, right)}
+      x2={Math.max(left, right)}
+      stroke="rgba(255,255,255,0.4)"
+      strokeOpacity={0.8}
+      fill="#ffffff"
+      fillOpacity={0.08}
+    />
+  );
+}
+
+function TrainingChart({ rows, selectionDomain, selectionAnalysis, isDragging, onApplyZoom, onClearSelection, onSelectionStart, onSelectionMove, onSelectionEnd }) {
+  return (
+    <div className="h-[380px] select-none cursor-crosshair relative">
+      {selectionAnalysis && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-50 pointer-events-auto">
+          <div className="bg-black/80 backdrop-blur-md border border-white/10 px-4 py-2 rounded-xl flex items-center gap-4 text-xs font-medium text-white shadow-xl">
+            <span className="text-white/50">Punti:</span> {selectionAnalysis.points}
+            <div className="w-px h-3 bg-white/20" />
+            <span className="text-white/50">Δ Loss:</span> {formatSigned(selectionAnalysis.deltaLoss, 4)} ({formatSigned(selectionAnalysis.deltaPct, 1, "%")})
+            <div className="w-px h-3 bg-white/20" />
+            <span className={selectionAnalysis.behavior?.includes("migliora") ? "text-emerald-400" : selectionAnalysis.behavior?.includes("peggiora") ? "text-red-400" : "text-white"}>{selectionAnalysis.behavior}</span>
+            {!isDragging && (
+              <>
+                <div className="w-px h-3 bg-white/20" />
+                <button onClick={(e) => { e.stopPropagation(); onApplyZoom?.(); }} className="px-2 py-0.5 bg-white/10 hover:bg-white/20 rounded text-white font-bold transition-colors">Zoom</button>
+                <button onClick={(e) => { e.stopPropagation(); onClearSelection?.(); }} className="px-2 py-0.5 bg-red-500/20 text-red-300 hover:bg-red-500/40 rounded font-bold transition-colors">X</button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart
+          data={rows}
+          margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
+          onMouseDown={(state) => onSelectionStart?.(state)}
+          onMouseMove={(state) => onSelectionMove?.(state)}
+          onMouseUp={(state) => onSelectionEnd?.(state)}
+          onMouseLeave={() => onSelectionEnd?.()}
+        >
+          <defs>
+            <linearGradient id="colorLossSmooth" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#ffffff" stopOpacity={0.4} />
+              <stop offset="95%" stopColor="#ffffff" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="colorLossRaw" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#ffffff" stopOpacity={0.05} />
+              <stop offset="95%" stopColor="#ffffff" stopOpacity={0} />
+            </linearGradient>
+            <linearGradient id="colorEval" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#60a5fa" stopOpacity={0.4} />
+              <stop offset="95%" stopColor="#60a5fa" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="rgba(255,255,255,0.03)" vertical={false} strokeDasharray="4 4" />
+          <XAxis dataKey="step" tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10, fontWeight: "600" }} tickLine={false} axisLine={false} minTickGap={30} />
+          <YAxis tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10, fontWeight: "600" }} tickLine={false} axisLine={false} width={45} />
+          <Tooltip content={<ChartTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.2)', strokeWidth: 1, strokeDasharray: '4 4' }} />
+          <HighlightArea domain={selectionDomain} />
+          <Area name="Loss" type="monotone" dataKey="trainLossSmooth" stroke="#ffffff" strokeWidth={2.5} fill="url(#colorLossSmooth)" connectNulls dot={false} isAnimationActive={false} activeDot={{ r: 5, fill: "#fff", stroke: "rgba(255,255,255,0.3)", strokeWidth: 6 }} />
+          <Area name="Raw" type="monotone" dataKey="trainLoss" stroke="rgba(255,255,255,0.15)" strokeWidth={1} fill="url(#colorLossRaw)" connectNulls dot={false} isAnimationActive={false} />
+          <Area name="Eval" type="monotone" dataKey="evalLoss" stroke="#60a5fa" strokeWidth={2.5} fill="url(#colorEval)" connectNulls dot={false} isAnimationActive={false} activeDot={{ r: 5, fill: "#60a5fa", stroke: "rgba(96,165,250,0.3)", strokeWidth: 6 }} />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function LearningChart({ rows, selectionDomain, selectionAnalysis, isDragging, onApplyZoom, onClearSelection, onSelectionStart, onSelectionMove, onSelectionEnd }) {
+  return (
+    <div className="h-[220px] select-none cursor-crosshair relative">
+      {selectionAnalysis && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-50 pointer-events-auto">
+          <div className="bg-black/80 backdrop-blur-md border border-white/10 px-4 py-2 rounded-xl flex items-center gap-4 text-xs font-medium text-white shadow-xl">
+            <span className="text-white/50">Punti:</span> {selectionAnalysis.points}
+            <div className="w-px h-3 bg-white/20" />
+            <span className="text-white/50">Δ LR:</span> {formatCompact(selectionAnalysis.lrEnd - selectionAnalysis.lrStart)}
+            {!isDragging && (
+              <>
+                <div className="w-px h-3 bg-white/20" />
+                <button onClick={(e) => { e.stopPropagation(); onApplyZoom?.(); }} className="px-2 py-0.5 bg-white/10 hover:bg-white/20 rounded text-white font-bold transition-colors">Zoom</button>
+                <button onClick={(e) => { e.stopPropagation(); onClearSelection?.(); }} className="px-2 py-0.5 bg-red-500/20 text-red-300 hover:bg-red-500/40 rounded font-bold transition-colors">X</button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart
+          data={rows}
+          margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
+          onMouseDown={(state) => onSelectionStart?.(state)}
+          onMouseMove={(state) => onSelectionMove?.(state)}
+          onMouseUp={(state) => onSelectionEnd?.(state)}
+          onMouseLeave={() => onSelectionEnd?.()}
+        >
+          <defs>
+            <linearGradient id="colorLR" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#10b981" stopOpacity={0.4} />
+              <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid stroke="rgba(255,255,255,0.03)" vertical={false} strokeDasharray="4 4" />
+          <XAxis dataKey="step" tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10, fontWeight: "600" }} tickLine={false} axisLine={false} minTickGap={30} />
+          <YAxis tickFormatter={(value) => Number(value).toExponential(1)} tick={{ fill: "rgba(255,255,255,0.3)", fontSize: 10, fontWeight: "600" }} tickLine={false} axisLine={false} width={55} />
+          <Tooltip content={<ChartTooltip />} cursor={{ stroke: 'rgba(16,185,129,0.3)', strokeWidth: 1, strokeDasharray: '4 4' }} />
+          <HighlightArea domain={selectionDomain} />
+          <Area name="LR" type="monotone" dataKey="learningRateSmooth" stroke="#10b981" strokeWidth={2.5} fill="url(#colorLR)" connectNulls dot={false} isAnimationActive={false} activeDot={{ r: 5, fill: "#10b981", stroke: "rgba(16,185,129,0.3)", strokeWidth: 6 }} />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function ChartControls({ rows, domain, onDomainChange, smoothing, onSmoothingChange, onReset }) {
+  const maxStep = rows[rows.length - 1]?.step ?? 0;
+  const setLast = (count) => {
+    if (!maxStep) return;
+    onDomainChange([Math.max(rows[0]?.step ?? 0, maxStep - count), maxStep]);
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center gap-1 bg-white/[0.02] rounded-lg p-1 border border-white/5 shadow-inner">
+        <SmallButton onClick={() => setLast(100)}>100</SmallButton>
+        <SmallButton onClick={() => setLast(300)}>300</SmallButton>
+        <SmallButton onClick={() => onDomainChange(null)} active={!domain}>Tutto</SmallButton>
+      </div>
+      <SmallButton onClick={onReset}>Reset</SmallButton>
+      <div className="ml-0 flex h-9 items-center gap-3 rounded-lg border border-white/5 bg-white/[0.02] px-4 lg:ml-2 shadow-inner">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-white/40">Smooth</span>
+        <input
+          type="range"
+          min="1"
+          max="80"
+          value={smoothing}
+          onChange={(event) => onSmoothingChange(Number(event.target.value))}
+          className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-black/50 shadow-inner outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:shadow-[0_0_10px_rgba(255,255,255,0.8)] [&::-webkit-slider-thumb]:hover:scale-110 [&::-webkit-slider-thumb]:transition-transform"
+        />
+        <span className="w-6 text-right font-mono text-[10px] font-bold text-white/70">{smoothing}</span>
+      </div>
+    </div>
+  );
+}
+
+function ControlButton({ icon: Icon, label, onClick, disabled = false, busy = false, tone = "default" }) {
+  const tones = {
+    default: "border-white/5 bg-white/[0.02] text-white/70 hover:bg-white/10 hover:text-white",
+    good: "border-emerald-500/20 bg-emerald-500/5 text-emerald-300 hover:bg-emerald-500/20",
+    warn: "border-amber-500/20 bg-amber-500/5 text-amber-300 hover:bg-amber-500/20",
+    danger: "border-red-500/20 bg-red-500/5 text-red-300 hover:bg-red-500/20",
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled || busy}
+      className={`inline-flex h-10 min-w-32 items-center justify-center gap-2 rounded-xl border px-5 text-[11px] font-bold uppercase tracking-wider transition-colors ${
+        disabled || busy ? "cursor-not-allowed border-white/5 bg-white/[0.02] text-white/20" : tones[tone]
+      }`}
+    >
+      <Icon size={16} className={busy ? "animate-spin" : ""} />
+      {label}
+    </button>
+  );
+}
 
 export default function Home() {
-  const [data, setData] = useState({ status: "IDLE", current: {}, history: [], epochs: [], systemSeries: emptyTelemetrySeries() });
+  const [data, setData] = useState({ status: "waiting", current: {}, history: [], epochs: [] });
+  const [refreshing, setRefreshing] = useState(false);
   const [lossDomain, setLossDomain] = useState(null);
   const [lrDomain, setLrDomain] = useState(null);
-  const [smoothingTrain, setSmoothingTrain] = useState(15);
-  const [smoothingEval, setSmoothingEval] = useState(15);
-  const [smoothingPpl, setSmoothingPpl] = useState(15);
-  const [smoothingLr, setSmoothingLr] = useState(1);
-  const [isInitialized, setIsInitialized] = useState(false);
-  const isRunning = data.status === "running";
-  const telemetry = data.systemSeries || emptyTelemetrySeries();
+  const [lossSmoothing, setLossSmoothing] = useState(16);
+  const [lrSmoothing, setLrSmoothing] = useState(4);
+  const [zoomInitialized, setZoomInitialized] = useState(false);
+  const [selectedDomain, setSelectedDomain] = useState(null);
+  const [dragSelection, setDragSelection] = useState(null);
+  const [control, setControl] = useState({ running: null, processes: null });
+  const [controlBusy, setControlBusy] = useState(null);
+  const [controlMessage, setControlMessage] = useState("");
+  const selectionRef = useRef({ start: null, end: null });
 
   const refreshData = useCallback(async () => {
+    setRefreshing(true);
     try {
       const response = await fetch("/api/metrics", { cache: "no-store" });
-      if (!response.ok) throw new Error();
+      if (!response.ok) throw new Error("metrics unavailable");
       const payload = await response.json();
-      setData(previous => ({
-        ...payload,
-        systemSeries: appendSystemTelemetry(previous.systemSeries, payload),
-      }));
-      if (!isInitialized) {
-        setLossDomain(payload.lossDomain ?? null);
-        setLrDomain(payload.lrDomain ?? null);
-        setIsInitialized(true);
+      const controlResponse = await fetch("/api/training/control", { cache: "no-store" });
+      if (controlResponse.ok) {
+        setControl(await controlResponse.json());
+      }
+      setData(payload);
+      if (!zoomInitialized) {
+        setLossDomain(payload.lossDomain || null);
+        setLrDomain(payload.lrDomain || null);
+        setZoomInitialized(true);
       }
     } catch {
-      setData(c => ({ ...c, status: "OFFLINE" }));
+      setData((current) => ({ ...current, status: "offline" }));
+    } finally {
+      setRefreshing(false);
     }
-  }, [isInitialized]);
+  }, [zoomInitialized]);
 
   useEffect(() => {
     const initial = setTimeout(refreshData, 0);
@@ -418,252 +783,349 @@ export default function Home() {
     };
   }, [refreshData]);
 
-  const history = useMemo(() => Array.isArray(data.history) ? data.history : [], [data.history]);
-  const latestMetric = data.current?.loss !== undefined ? data.current : (history[history.length - 1] || {});
-  const currentStep = Number(data.current?.global_step ?? latestMetric.global_step ?? data.start_global_step ?? 0);
-  const totalSteps = Number(data.total_steps || latestMetric.total_steps || 0);
-  const progress = totalSteps > 0 ? Math.min(100, (currentStep / totalSteps) * 100) : 0;
+  const history = useMemo(() => (Array.isArray(data.history) ? data.history : []), [data.history]);
+  const latest = latestFrom(data);
+  const allRows = useMemo(() => metricRows(history), [history]);
+  const lossRows = useMemo(() => movingAverageRows(allRows, lossSmoothing), [allRows, lossSmoothing]);
+  const lrRowsAll = useMemo(() => movingAverageRows(allRows, lrSmoothing).filter((row) => row.learningRate !== null), [allRows, lrSmoothing]);
+
+  const currentStep = Number(data.current?.global_step ?? latest.global_step ?? data.start_global_step ?? 0);
+  const totalSteps = Number(data.total_steps || latest.total_steps || 0);
+  const progress = totalSteps > 0 ? Math.max(0, Math.min(100, (currentStep / totalSteps) * 100)) : 0;
+  const etaSeconds = computeEta(history, currentStep, totalSteps);
+  const analysis = useMemo(() => computeAnalysis(history, allRows, currentStep, totalSteps), [history, allRows, currentStep, totalSteps]);
 
   const system = data.system || {};
-  const currentVram = numericOrNull(system.gpu_memory_used_gb ?? latestMetric.vram_reserved_gb ?? latestMetric.vram_allocated_gb);
-  const totalVram = numericOrNull(system.gpu_memory_total_gb);
-  const vramDomain = [0, Math.max(1, Math.ceil(totalVram || currentVram || 1))];
+  const config = data.config || {};
+  const stage = data.pipeline_step?.id || config.pipeline_step || "manual";
+  const stageTitle = data.pipeline_step?.title || stage;
+  const gpuName = system.gpu_name || data.hardware?.gpu || "GPU";
+  const currentVram = numberOrNull(system.gpu_memory_used_gb ?? latest.vram_reserved_gb ?? latest.vram_allocated_gb);
+  const totalVram = numberOrNull(system.gpu_memory_total_gb);
+  const vramPercent = totalVram ? (currentVram / totalVram) * 100 : null;
+  const isRunning = data.status === "running";
+  const controlHasProcessList = Array.isArray(control.processes);
+  const trainingRunning = controlHasProcessList ? Boolean(control.running) : isRunning;
+  const trainingPaused = Boolean(control.paused);
+  const displayStatus = trainingPaused ? "paused" : trainingRunning ? "running" : data.status || "waiting";
+  const controlAction = control.control?.action || "-";
+  const controlPidText = Array.isArray(control.pids) && control.pids.length ? control.pids.join(", ") : "-";
+  const latestTokens = Number.isFinite(Number(latest.tokens))
+    ? Number(latest.tokens).toLocaleString("it-IT")
+    : "-";
+  const batchText = `${config.per_device_batch_size || "-"} x ${config.gradient_accumulation_steps || "-"}`;
+  const saveText = config.save_steps ? `ogni ${config.save_steps} step` : "-";
+  const cpuOptText = latest.cpu_optimizer_active ? "attivo" : config.cpu_optimizer || "auto";
+  const historyText = history.length.toLocaleString("it-IT");
+  const safeLossDomain = clampDomain(lossDomain, lossRows);
+  const safeLrDomain = clampDomain(lrDomain, lrRowsAll);
+  const safeSelectedDomain = clampDomain(selectedDomain, allRows);
+  const isDragging = !!dragSelection;
+  const activeSelectionDomain = dragSelection || safeSelectedDomain;
+  const periodDomain = safeSelectedDomain || safeLossDomain;
+  const periodMode = safeSelectedDomain ? "selezione" : safeLossDomain ? "zoom visibile" : "run completo";
+  const periodAnalysis = useMemo(() => computePeriodAnalysis(history, allRows, periodDomain), [history, allRows, periodDomain]);
+  const selectionAnalysis = useMemo(() => activeSelectionDomain ? computePeriodAnalysis(history, allRows, activeSelectionDomain) : null, [history, allRows, activeSelectionDomain]);
 
-  const lossRows = useMemo(() => {
-    const rows = new Map();
-    history.forEach(item => {
-      if (!item.global_step) return;
-      const step = Number(item.global_step);
-      const row = rows.get(step) || { step };
-      if (item.type === "train") { row.trainLoss = item.loss; row.perplexity = item.perplexity; }
-      if (item.type === "eval") { row.evalLoss = item.loss; }
-      rows.set(step, row);
-    });
-    const arr = Array.from(rows.values()).sort((a, b) => a.step - b.step);
-    const smoothedArr = arr.map((item, index) => {
-      const getAvg = (key, window) => {
-        const start = Math.max(0, index - window);
-        const subset = arr.slice(start, index + 1);
-        const values = subset.map(s => s[key]).filter(v => v !== undefined);
-        return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : undefined;
-      };
-      return { ...item, trainLoss: getAvg('trainLoss', smoothingTrain), evalLoss: getAvg('evalLoss', smoothingEval), perplexity: getAvg('perplexity', smoothingPpl), rawTrainLoss: item.trainLoss };
-    });
-    return smoothedArr;
-  }, [history, smoothingTrain, smoothingEval, smoothingPpl]);
+  const visibleLossRows = safeLossDomain
+    ? lossRows.filter((row) => row.step >= safeLossDomain[0] && row.step <= safeLossDomain[1])
+    : lossRows;
+  const visibleLrRows = safeLrDomain
+    ? lrRowsAll.filter((row) => row.step >= safeLrDomain[0] && row.step <= safeLrDomain[1])
+    : lrRowsAll;
 
-  const lrRows = useMemo(() => {
-    const arr = history.filter(i => i.global_step && i.learning_rate !== undefined).map(i => ({ step: Number(i.global_step), learningRate: i.learning_rate })).sort((a, b) => a.step - b.step);
-    const smoothedArr = arr.map((item, index) => {
-      const start = Math.max(0, index - smoothingLr);
-      const values = arr.slice(start, index + 1).map(s => s.learningRate);
-      return { ...item, learningRate: values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : item.learningRate };
-    });
-    return smoothedArr;
-  }, [history, smoothingLr]);
+  function persistZoom(patch) {
+    fetch("/api/zoom", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }).catch(() => {});
+  }
 
-  const zoomedLossRows = useMemo(() => lossDomain ? lossRows.filter(r => r.step >= lossDomain[0] && r.step <= lossDomain[1]) : lossRows, [lossRows, lossDomain]);
-  const zoomedLrRows = useMemo(() => lrDomain ? lrRows.filter(r => r.step >= lrDomain[0] && r.step <= lrDomain[1]) : lrRows, [lrRows, lrDomain]);
+  function applyLossDomain(domain) {
+    const next = domain ? clampDomain(domain, lossRows) : null;
+    setLossDomain(next);
+    persistZoom({ lossDomain: next });
+  }
+
+  function applyLrDomain(domain) {
+    const next = domain ? clampDomain(domain, lrRowsAll) : null;
+    setLrDomain(next);
+    persistZoom({ lrDomain: next });
+  }
+
+  function beginAreaSelection(state) {
+    const step = chartStep(state);
+    if (step === null) return;
+    selectionRef.current = { start: step, end: step };
+    setDragSelection([step, step]);
+  }
+
+  function moveAreaSelection(state) {
+    if (selectionRef.current.start === null) return;
+    const step = chartStep(state);
+    if (step === null) return;
+    selectionRef.current = { ...selectionRef.current, end: step };
+    setDragSelection([selectionRef.current.start, step].sort((a, b) => a - b));
+  }
+
+  function finishAreaSelection(state) {
+    const step = chartStep(state);
+    if (step !== null && selectionRef.current.start !== null) {
+      selectionRef.current = { ...selectionRef.current, end: step };
+    }
+    const { start, end } = selectionRef.current;
+    selectionRef.current = { start: null, end: null };
+    setDragSelection(null);
+    if (start === null || end === null || Math.abs(end - start) < 1) return;
+    const next = clampDomain([Math.min(start, end), Math.max(start, end)], allRows);
+    if (next) setSelectedDomain(next);
+  }
+
+  function zoomToSelectedPeriod() {
+    if (!safeSelectedDomain) return;
+    applyLossDomain(safeSelectedDomain);
+    applyLrDomain(safeSelectedDomain);
+  }
+
+  async function sendTrainingControl(action) {
+    setControlBusy(action);
+    setControlMessage("");
+    try {
+      const response = await fetch("/api/training/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, stage, currentStep }),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        setControlMessage(payload.error || "Comando non riuscito");
+      } else {
+        setControl(payload);
+        const labels = {
+          pause: "Training in pausa",
+          resume: "Training ripreso",
+          save: "Salvataggio richiesto",
+        };
+        setControlMessage(labels[action] || "Comando inviato");
+      }
+      await refreshData();
+    } catch (error) {
+      setControlMessage(error.message || "Errore comando");
+    } finally {
+      setControlBusy(null);
+    }
+  }
 
   return (
-    <main className="min-h-screen w-full pb-32 font-sans overflow-x-hidden">
-      <StatusBar vram={currentVram} vramTotal={totalVram} status={data.status} />
-      
-      <div className="px-6 sm:px-10">
-        <PageHeader
-          eyebrow="Neural Protocol 4.2.0"
-          title="Jarvis Core"
-          badge={
-            <Badge className={`rounded-full px-4 py-1.5 text-[10px] font-black uppercase tracking-[0.3em] transition-all duration-700 ${isRunning ? 'bg-white text-black animate-pulse' : 'bg-white/5 text-white/30 border-white/10'}`}>
-              {data.status || "IDLE"}
-            </Badge>
-          }
-          actions={
-            <div className="flex gap-6">
-               <button onClick={refreshData} className="size-12 rounded-xl bg-white/[0.02] border border-white/10 flex items-center justify-center transition-all hover:bg-white hover:text-black group">
-                  <RefreshCcw size={18} className={`${isRunning ? "animate-spin" : ""} group-hover:rotate-180 transition-transform duration-700`} />
-               </button>
-               <Link href="/test-model" className="px-8 h-12 rounded-xl bg-white text-black text-[12px] font-black uppercase tracking-[0.24em] hover:bg-white/90 transition-all shadow-xl flex items-center gap-3">
-                  <Terminal size={14} /> Test Model <ChevronRight size={14} />
-               </Link>
+    <main className="min-h-screen w-full bg-[#0a0a0a] text-white overflow-x-hidden font-sans pb-24 selection:bg-white/20">
+      <div className="relative z-10 mx-auto max-w-screen-2xl px-4 py-8 sm:px-6 lg:px-8 space-y-8">
+        
+        <header className="relative flex flex-col md:flex-row items-start md:items-center justify-between gap-6 pb-4 border-b border-white/5">
+          <div className="relative min-w-0 flex-1">
+            <div className="mb-3 flex flex-wrap items-center gap-3">
+              <Badge className={`rounded-lg px-3 py-1 text-[10px] font-bold uppercase tracking-wider ${trainingRunning ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-white/5 text-white/50 border border-white/10"}`}>
+                <span className="flex items-center gap-2">
+                  {trainingRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />}
+                  {displayStatus}
+                </span>
+              </Badge>
+              <span className="text-xs font-medium text-white/50">{stageTitle}</span>
             </div>
-          }
-        />
-
-        <div className="mb-14 admin-fade-up">
-           <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-6">
-              <TelemetryCard label="CPU Load" value={formatFixed(system.cpu_percent, 1)} unit="%" data={telemetry.cpu} icon={Cpu} color="#FFFFFF" />
-              <TelemetryCard label="GPU Compute" value={formatFixed(system.gpu_util_percent, 1)} unit="%" data={telemetry.gpu} icon={Monitor} color="#10b981" />
-              <TelemetryCard label="VRAM Used" value={formatFixed(currentVram, 2)} unit="GB" data={telemetry.vram} icon={Database} color="#3b82f6" domain={vramDomain} />
-              <TelemetryCard label="RAM Load" value={formatFixed(system.ram_percent, 1)} unit="%" data={telemetry.ram} icon={Globe} color="#f59e0b" />
-              
-              <div className="glass-card rounded-[1.5rem] p-5 border border-white/[0.04] relative overflow-hidden group/specs">
-                 <div className="flex flex-col justify-between h-full relative z-10">
-                    <div className="flex items-center gap-2.5 mb-4">
-                       <HardDrive size={14} className="text-white/20" />
-                       <span className="text-[9px] font-black uppercase tracking-[0.15em] text-white/20">System Specs</span>
-                    </div>
-                    <div className="space-y-3">
-                       <div className="flex justify-between items-center gap-3"><span className="text-[9px] font-bold text-white/10 uppercase">GPU</span><span className="text-[11px] font-black text-white/60 truncate">{system.gpu_name || data.hardware?.gpu || "GPU non rilevata"}</span></div>
-                       <div className="flex justify-between items-center gap-3"><span className="text-[9px] font-bold text-white/10 uppercase">CPU</span><span className="text-[11px] font-black text-white/60 truncate">{data.hardware?.cpu || "Detecting..."}</span></div>
-                       <div className="flex justify-between items-center"><span className="text-[9px] font-bold text-white/10 uppercase">RAM</span><span className="text-[11px] font-black text-white/60">{formatGb(system.ram_used_gb)} / {formatGb(system.ram_total_gb)}</span></div>
-                       <div className="flex justify-between items-center"><span className="text-[9px] font-bold text-white/10 uppercase">Disk</span><span className="text-[11px] font-black text-white/60">{formatGb(system.disk_free_gb)} free</span></div>
-                    </div>
-                 </div>
-              </div>
-           </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-6 mb-14 items-stretch">
-          <MetricCard icon={LayoutDashboard} label="Process Step" value={String(currentStep)} caption={`Target: ${totalSteps || "INF"}`} data={lossRows.slice(-60)} dataKey="step" />
-          <MetricCard icon={Gauge} label="Loss Delta" value={formatNumber(latestMetric.loss)} caption="Neural alignment" data={lossRows.slice(-60)} dataKey="trainLoss" smoothing={smoothingTrain} onSmoothingChange={setSmoothingTrain} />
-          <MetricCard icon={LineChartIcon} label="Optimization" value={formatNumber(latestMetric.perplexity, 2)} caption="PPL metric" data={lossRows.slice(-60)} dataKey="perplexity" smoothing={smoothingPpl} onSmoothingChange={setSmoothingPpl} />
-          <MetricCard icon={Zap} label="Flux Rate" value={formatCompact(latestMetric.learning_rate)} caption="Learning modulation" data={lrRows.slice(-60)} dataKey="learningRate" smoothing={smoothingLr} onSmoothingChange={setSmoothingLr} />
-
-          <SurfaceCard title="System Load" className="h-full">
-            <div className="flex flex-col h-full justify-between gap-6">
-              <div className="space-y-4">
-                <span className="text-5xl font-black tabular-nums text-white tracking-tighter text-glow">{progress.toFixed(1)}%</span>
-                <div className="h-3 w-full bg-white/[0.02] rounded-full overflow-hidden border border-white/5 p-1 shadow-inner relative">
-                  <div className="h-full bg-white rounded-full transition-all duration-1000 ease-out relative" style={{ width: `${progress}%` }}>
-                    <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent animate-pulse" />
-                  </div>
-                </div>
-              </div>
-              <div className="space-y-0">
-                 <SummaryRow icon={Globe} label="VRAM" value={`${formatGb(currentVram)} / ${formatGb(totalVram)}`} />
-                 <SummaryRow icon={Server} label="GPU Temp" value={formatUnit(system.gpu_temp_c, "C", 0)} />
-                 <SummaryRow icon={ShieldCheck} label="Power" value={formatUnit(system.gpu_power_w, "W", 1)} colorClass="text-emerald-400" />
-              </div>
-            </div>
-          </SurfaceCard>
-        </div>
-
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 mb-16">
-          <SurfaceCard 
-            title="Trajectory Analysis"
-            badge={
-              <div className="flex items-center gap-6">
-                <div className="flex items-center gap-6 bg-black/40 px-6 py-3 rounded-[1.25rem] border border-white/[0.05] backdrop-blur-xl">
-                  <div className="flex items-center gap-4">
-                    <span className="text-[10px] font-black uppercase text-white/20">Train</span>
-                    <input type="range" min="1" max="50" value={smoothingTrain} onChange={(e) => setSmoothingTrain(parseInt(e.target.value))} className="w-20 accent-white h-1 bg-white/5 rounded-full appearance-none cursor-pointer" />
-                    <span className="text-[10px] font-bold text-white/50">{smoothingTrain}</span>
-                  </div>
-                  <div className="w-px h-5 bg-white/10" />
-                  <div className="flex items-center gap-4">
-                    <span className="text-[10px] font-black uppercase text-white/20">Eval</span>
-                    <input type="range" min="1" max="50" value={smoothingEval} onChange={(e) => setSmoothingEval(parseInt(e.target.value))} className="w-20 accent-white h-1 bg-white/5 rounded-full appearance-none cursor-pointer" />
-                    <span className="text-[10px] font-bold text-white/50">{smoothingEval}</span>
-                  </div>
-                </div>
-                <button onClick={() => setLossDomain(null)} className="p-3 rounded-xl bg-white/[0.05] hover:bg-white hover:text-black transition-all border border-white/5">
-                   <RotateCcw size={14} />
-                </button>
-              </div>
-            }
-          >
-            <div className="h-[400px] relative">
-              <ResponsiveContainer>
-                <AreaChart data={zoomedLossRows} margin={{ left: -20, right: 0, top: 20, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="colorLoss" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#FFFFFF" stopOpacity={0.2}/><stop offset="95%" stopColor="#FFFFFF" stopOpacity={0}/></linearGradient>
-                  </defs>
-                  <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.01)" strokeDasharray="12 12" />
-                  <XAxis dataKey="step" hide /><YAxis tick={{ fill: "rgba(255,255,255,0.15)", fontSize: 11, fontWeight: 900 }} axisLine={false} tickLine={false} />
-                  <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.18)", strokeWidth: 1 }} />
-                  <Area type="monotone" dataKey="trainLoss" stroke="#FFFFFF" strokeWidth={4} fillOpacity={1} fill="url(#colorLoss)" dot={false} />
-                  <Area type="monotone" dataKey="evalLoss" stroke="rgba(255,255,255,0.3)" strokeWidth={2} fillOpacity={0} dot={false} />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-            <ZoomMinimap data={lossRows} dataKey="trainLoss" domain={lossDomain} onDomainChange={setLossDomain} color="#FFFFFF" />
-          </SurfaceCard>
-
-          <SurfaceCard 
-            title="Learning Flux"
-            badge={
-              <div className="flex items-center gap-6">
-                <div className="flex items-center gap-6 bg-black/40 px-6 py-3 rounded-[1.25rem] border border-white/[0.05] backdrop-blur-xl">
-                  <span className="text-[10px] font-black uppercase text-white/20">Smoothing</span>
-                  <input type="range" min="1" max="50" value={smoothingLr} onChange={(e) => setSmoothingLr(parseInt(e.target.value))} className="w-32 accent-white h-1 bg-white/5 rounded-full appearance-none cursor-pointer" />
-                  <span className="text-[10px] font-bold text-white/50">{smoothingLr}</span>
-                </div>
-                <button onClick={() => setLrDomain(null)} className="p-3 rounded-xl bg-white/[0.05] hover:bg-white hover:text-black transition-all border border-white/5">
-                   <RotateCcw size={14} />
-                </button>
-              </div>
-            }
-          >
-            <div className="h-[400px] relative">
-              <ResponsiveContainer>
-                <AreaChart data={zoomedLrRows} margin={{ left: -20, right: 0, top: 20, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="colorLr" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#FFFFFF" stopOpacity={0.2}/><stop offset="95%" stopColor="#FFFFFF" stopOpacity={0}/></linearGradient>
-                  </defs>
-                  <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.01)" strokeDasharray="12 12" />
-                  <XAxis dataKey="step" hide /><YAxis tickFormatter={formatCompact} tick={{ fill: "rgba(255,255,255,0.15)", fontSize: 11, fontWeight: 900 }} axisLine={false} tickLine={false} />
-                  <Tooltip content={<ChartTooltip />} cursor={{ stroke: "rgba(255,255,255,0.18)", strokeWidth: 1 }} />
-                  <Area type="monotone" dataKey="learningRate" stroke="#FFFFFF" strokeWidth={4} fillOpacity={1} fill="url(#colorLr)" dot={false} />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-            <ZoomMinimap data={lrRows} dataKey="learningRate" domain={lrDomain} onDomainChange={setLrDomain} color="#FFFFFF" />
-          </SurfaceCard>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          <div className="lg:col-span-8 flex flex-col h-full">
-            <SurfaceCard title="Event History" description="Neural sequence log" className="flex-1 h-full flex flex-col">
-              <div className="overflow-auto h-0 flex-1 relative custom-scrollbar pr-4 -mr-4">
-                <table className="w-full text-left text-[10px] border-separate border-spacing-y-4">
-                  <thead>
-                    <tr className="text-white/10 font-black uppercase tracking-[0.4em]">
-                      <th className="py-4 px-8">Epoch</th>
-                      <th className="py-4 px-8">Step Range</th>
-                      <th className="py-4 px-8 text-right">Metric (PPL)</th>
-                      <th className="py-4 px-8 text-right">State</th>
-                    </tr>
-                  </thead>
-                  <tbody className="font-bold">
-                    {data.epochs?.length > 0 ? (
-                      data.epochs.map((e, i) => (
-                        <tr key={i} className="group glass-card rounded-2xl hover:bg-white/[0.03] transition-all border-white/[0.02]">
-                          <td className="py-6 px-8 rounded-l-2xl"><div className="size-10 rounded-xl bg-white/[0.05] flex items-center justify-center font-black text-white text-lg">{e.epoch}</div></td>
-                          <td className="py-6 px-8"><div className="flex flex-col gap-1"><span className="font-mono text-white/50 text-sm">{e.start_global_step} → {e.end_global_step}</span></div></td>
-                          <td className="py-6 px-8 text-right"><span className="font-black text-white text-2xl text-glow">{formatNumber(e.train_perplexity, 2)}</span></td>
-                          <td className="py-6 px-8 text-right rounded-r-2xl"><div className="flex justify-end"><span className={`flex items-center gap-3 px-4 py-2 rounded-full text-[9px] font-black uppercase tracking-[0.3em] border ${e.complete ? 'bg-emerald-500/5 text-emerald-400 border-emerald-500/10' : 'bg-white/5 text-white/20 border-white/5'}`}>{e.complete ? "STABLE" : "SYNCING"}</span></div></td>
-                        </tr>
-                      ))
-                    ) : (
-                      <tr><td colSpan="4" className="py-40 text-center opacity-10 font-black uppercase tracking-[0.8em]">Awaiting Stream</td></tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </SurfaceCard>
+            <h1 className="text-3xl font-bold tracking-tight text-white md:text-4xl">Jarvis Dashboard</h1>
           </div>
 
-          <div className="lg:col-span-4 space-y-8">
-             <SurfaceCard title="Memory Pool">
-                <div className="space-y-1">
-                   <SummaryRow icon={Database} label="History" value={history.length} />
-                   <SummaryRow icon={Terminal} label="Disk Used" value={`${formatFixed(system.disk_percent, 1)}%`} colorClass="text-white/60" />
-                   <SummaryRow icon={RefreshCcw} label="Updated" value={system.captured_at ? new Date(system.captured_at).toLocaleTimeString() : "-"} colorClass="text-emerald-400" />
-                </div>
-             </SurfaceCard>
-             <SurfaceCard title="Raw Config">
-                <div className="p-1.5 bg-white/[0.03] rounded-2xl border border-white/[0.05] overflow-hidden">
-                  <pre className="text-[11px] text-white/25 font-mono leading-relaxed p-6 bg-black/60 rounded-xl overflow-auto max-h-[400px] custom-scrollbar">
-                    {JSON.stringify(data.config || {}, null, 2)}
-                  </pre>
-                </div>
-             </SurfaceCard>
+          <div className="relative flex flex-wrap items-center gap-3 mt-2 md:mt-0">
+            <button
+              type="button"
+              onClick={refreshData}
+              className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-white/5 bg-white/[0.02] text-white/60 transition-colors hover:bg-white/10 hover:text-white"
+              aria-label="Aggiorna dashboard"
+            >
+              <RefreshCcw size={16} className={refreshing ? "animate-spin" : ""} />
+            </button>
+            <Link
+              href="/test-model"
+              className="inline-flex h-10 items-center gap-2 rounded-xl bg-white px-5 text-[11px] font-bold uppercase tracking-wider text-black transition-colors hover:bg-white/90"
+            >
+              <Bot size={16} />
+              Test Model
+              <ArrowRight size={14} className="text-black/50" />
+            </Link>
           </div>
+        </header>
+
+        <section className="grid grid-cols-1 xl:grid-cols-[1fr_auto] gap-6">
+          <div className="rounded-3xl border border-white/5 bg-white/[0.02] backdrop-blur-md p-6 sm:p-8 relative overflow-hidden group">
+            <div className="relative mb-5 flex flex-wrap items-end justify-between gap-6">
+              <div>
+                <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-white/40 mb-2">
+                  <Play size={14} /> Progresso
+                </div>
+                <div className="text-xl font-bold text-white/90">
+                  Step <span className="text-white text-2xl">{currentStep.toLocaleString("it-IT")}</span> <span className="text-white/30 text-lg">/ {totalSteps ? totalSteps.toLocaleString("it-IT") : "-"}</span>
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-5xl font-bold tracking-tighter text-white">
+                  {formatFixed(progress, 1)}%
+                </div>
+                <div className="text-xs font-medium text-white/40 mt-1">ETA <span className="text-white/70">{formatDuration(etaSeconds)}</span></div>
+              </div>
+            </div>
+            <div className="relative h-2.5 rounded-full bg-black/40 shadow-inner overflow-hidden mb-6 border border-white/5">
+              <div 
+                className="absolute top-0 left-0 h-full rounded-full bg-gradient-to-r from-white/40 via-white to-white shadow-[0_0_15px_rgba(255,255,255,0.5)] transition-all duration-1000" 
+                style={{ width: `${progress}%` }} 
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-white/5">
+              <div className="flex flex-wrap gap-2">
+                <ControlButton
+                  icon={Pause}
+                  label="Pausa"
+                  tone="warn"
+                  disabled={!trainingRunning || trainingPaused}
+                  busy={controlBusy === "pause"}
+                  onClick={() => sendTrainingControl("pause")}
+                />
+                <ControlButton
+                  icon={Play}
+                  label="Riprendi"
+                  tone="good"
+                  disabled={!trainingRunning || !trainingPaused}
+                  busy={controlBusy === "resume"}
+                  onClick={() => sendTrainingControl("resume")}
+                />
+                <ControlButton
+                  icon={Save}
+                  label="Salva ora"
+                  disabled={!trainingRunning || trainingPaused}
+                  busy={controlBusy === "save"}
+                  onClick={() => sendTrainingControl("save")}
+                />
+              </div>
+              {controlMessage && (
+                <div className="text-[11px] font-bold uppercase tracking-wider text-white/50 animate-pulse">
+                  {controlMessage}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-2 gap-4 w-full xl:w-[460px]">
+            <HeaderInfo label="Stage" value={stage} />
+            <HeaderInfo label="Batch" value={batchText} />
+            <HeaderInfo label="Save" value={saveText} />
+            <HeaderInfo label="CPU opt" value={cpuOptText} />
+            <HeaderInfo label="History" value={historyText} />
+            <HeaderInfo label="PID" value={controlPidText} />
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+          <MetricTile icon={Gauge} label="Loss" value={formatLoss(latest.loss)} sub="Ultimo batch" />
+          <MetricTile icon={LineChartIcon} label="Perplexity" value={formatFixed(latest.perplexity, 1)} sub="Perplexity corrente" />
+          <MetricTile icon={Zap} label="Learning Rate" value={formatCompact(latest.learning_rate)} sub="Scheduler attivo" />
+          <MetricTile icon={Activity} label="Token" value={latestTokens} sub="Ultimo optimizer step" />
+        </section>
+
+        <div className="grid grid-cols-1 xl:grid-cols-[1fr_380px] 2xl:grid-cols-[1fr_420px] gap-8">
+          
+          <div className="space-y-8 min-w-0">
+            <Panel
+              title="Andamento Loss Globale"
+              icon={LineChartIcon}
+              action={
+                <ChartControls
+                  rows={lossRows}
+                  domain={safeLossDomain}
+                  onDomainChange={applyLossDomain}
+                  smoothing={lossSmoothing}
+                  onSmoothingChange={setLossSmoothing}
+                  onReset={() => applyLossDomain(null)}
+                />
+              }
+            >
+              <TrainingChart
+                rows={visibleLossRows}
+                selectionDomain={activeSelectionDomain}
+                selectionAnalysis={selectionAnalysis}
+                isDragging={isDragging}
+                onApplyZoom={zoomToSelectedPeriod}
+                onClearSelection={() => setSelectedDomain(null)}
+                onSelectionStart={beginAreaSelection}
+                onSelectionMove={moveAreaSelection}
+                onSelectionEnd={finishAreaSelection}
+              />
+              <ZoomStrip rows={lossRows} domain={safeLossDomain} onDomainChange={applyLossDomain} />
+            </Panel>
+
+            <Panel
+              title="Traiettoria Learning Rate"
+              icon={Zap}
+              action={
+                <ChartControls
+                  rows={lrRowsAll}
+                  domain={safeLrDomain}
+                  onDomainChange={applyLrDomain}
+                  smoothing={lrSmoothing}
+                  onSmoothingChange={setLrSmoothing}
+                  onReset={() => applyLrDomain(null)}
+                />
+              }
+            >
+              <LearningChart
+                rows={visibleLrRows}
+                selectionDomain={activeSelectionDomain}
+                selectionAnalysis={selectionAnalysis}
+                isDragging={isDragging}
+                onApplyZoom={zoomToSelectedPeriod}
+                onClearSelection={() => setSelectedDomain(null)}
+                onSelectionStart={beginAreaSelection}
+                onSelectionMove={moveAreaSelection}
+                onSelectionEnd={finishAreaSelection}
+              />
+              <ZoomStrip rows={lrRowsAll} domain={safeLrDomain} onDomainChange={applyLrDomain} />
+            </Panel>
+          </div>
+
+          <aside className="space-y-6">
+            
+            <Panel title="Risorse" icon={Monitor}>
+              <div className="space-y-1">
+                <ResourceRow icon={Cpu} label="CPU" value={`${formatFixed(system.cpu_percent, 1)}%`} percent={system.cpu_percent} />
+                <ResourceRow icon={Monitor} label="GPU" value={`${formatFixed(system.gpu_util_percent, 1)}%`} percent={system.gpu_util_percent} tone="bg-white" />
+                <ResourceRow icon={Database} label="VRAM" value={`${formatGb(currentVram)} / ${formatGb(totalVram)}`} percent={vramPercent} tone="bg-white/70" />
+                <ResourceRow icon={MemoryStick} label="RAM" value={`${formatGb(system.ram_used_gb)}`} percent={system.ram_percent} tone="bg-white/40" />
+              </div>
+              <div className="mt-5 pt-4 border-t border-white/5 space-y-1">
+                <DetailRow label="Temp GPU" value={formatUnit(system.gpu_temp_c, " C", 0)} />
+                <DetailRow label="Power" value={formatUnit(system.gpu_power_w, " W", 1)} />
+              </div>
+            </Panel>
+
+            <Panel title="Trend Generale" icon={Activity}>
+              <div className="mb-4 rounded-xl bg-white/[0.02] p-4 border border-white/5 flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-white/40">Verdetto</span>
+                <span className={`text-sm font-bold ${
+                  analysis.verdict?.includes('miglioramento') ? 'text-emerald-400' :
+                  analysis.verdict?.includes('peggiora') ? 'text-red-400' : 'text-white'
+                }`}>{analysis.verdict}</span>
+              </div>
+              <div className="space-y-1">
+                <DetailRow label="Trend 120" value={analysis.trendPct === null ? "-" : `${formatFixed(analysis.trendPct, 1)}%`} />
+                <DetailRow label="Loss media" value={formatLoss(analysis.recentAvg)} />
+                <DetailRow label="Volatilità" value={formatLoss(analysis.volatility)} />
+                <DetailRow label="Velocità" value={`${formatFixed(analysis.stepsPerMinute, 1)} step/min`} />
+                <DetailRow label="Eval Gap" value={analysis.evalGap === null ? "-" : formatLoss(analysis.evalGap)} />
+              </div>
+            </Panel>
+
+          </aside>
         </div>
       </div>
     </main>
   );
 }
-
-const updatedAt = ""; 

@@ -236,8 +236,7 @@ function Test-CheckpointComplete {
 
     $HasModel = (Test-Path (Join-Path $Checkpoint.FullName "pytorch_model.bin")) -or
         (Test-Path (Join-Path $Checkpoint.FullName "model.safetensors"))
-    $HasState = (Test-Path (Join-Path $Checkpoint.FullName "optimizer.bin")) -and
-        (Test-Path (Join-Path $Checkpoint.FullName "scheduler.bin"))
+    $HasState = Test-Path (Join-Path $Checkpoint.FullName "scheduler.bin")
 
     return ($HasModel -and $HasState)
 }

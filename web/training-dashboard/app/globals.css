@@ -130,4 +130,13 @@
     50% { opacity: 0.5; }
     100% { transform: translateY(1000%); opacity: 0; }
   }
+
+  .animate-caret {
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink {
+    from, to { opacity: 1; }
+    50% { opacity: 0; }
+  }
 }

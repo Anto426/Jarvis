@@ -97,6 +97,12 @@ SOURCE_PROFILES = {
         "max_digit_ratio": 0.55,
         "detect_language": True,
     },
+    "jarvis_personality": {
+        "min_length": 40,
+        "min_alpha_ratio": 0.35,
+        "max_digit_ratio": 0.45,
+        "detect_language": False,
+    },
 }
 
 AUTOMOTIVE_TERMS = [

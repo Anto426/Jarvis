@@ -97,6 +97,14 @@ SOURCE_TOKEN_PROFILES = {
         "min_tokens": 16,
         "prompt_keep": "tail",
     },
+    "jarvis_personality": {
+        "mode": "chat",
+        "max_length": 1024,
+        "min_tokens": 16,
+        "assistant_turns": "all",
+        "prompt_keep": "tail",
+        "format": "chat",
+    },
 }
 
 os.makedirs(SHARD_DIR, exist_ok=True)
