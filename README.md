@@ -13,13 +13,13 @@ jarvis@garage:~$ whoami
 Italian LLM training lab
 
 jarvis@garage:~$ echo "focus"
-Automotive reasoning, diagnostics, OBD/DTC knowledge, and workshop-style answers
+Staged Italian assistant training: language, context, automotive technique, and final premium personality
 
 jarvis@garage:~$ echo "base"
 GPT-NeoX style causal language model trained from local and public data
 ```
 
-Jarvis is a local training pipeline for building an Italian language model with a strong automotive direction.
+Jarvis is a local training pipeline for building an Italian language model with a staged, checkpointed path toward a technical assistant.
 The project is designed to keep heavy data, caches, tokenizer files, and checkpoints on this repository disk instead of filling the main Windows drive.
 
 <p align="center">
@@ -34,7 +34,8 @@ The project is designed to keep heavy data, caches, tokenizer files, and checkpo
 - Local data import from `data/local/`
 - Wikimedia direct fallback when Hugging Face downloads are blocked
 - SentencePiece tokenizer build
-- Parquet shard packing for language-model pretraining
+- Staged pipeline with official checkpoints between training phases
+- Structured Parquet shards for language modeling, Q/A, and chat-style supervised training
 - Accelerate-based BF16/FP16 training with checkpoint auto-resume
 - Smart launcher that skips data regeneration when packed shards are already valid
 
@@ -78,6 +79,18 @@ Run only the dashboard:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -DashboardOnly
+```
+
+Open the model test page on the same Next.js server:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_model.ps1
+```
+
+This opens `http://127.0.0.1:8765/test-model`. The old terminal chat is still available with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_model.ps1 -Cli
 ```
 
 Run training without the dashboard:
@@ -141,6 +154,8 @@ data/local -> data/raw -> data/cleaned -> data/cleaned/deduplicated
           -> data/tokenizer -> data/shards -> checkpoints
 ```
 
+`data/shards/` is split by source and training format. Plain text examples keep full-token labels; Q/A, choice, instruction, and chat examples carry `input_ids`, `attention_mask`, and masked `labels` so the model learns the assistant completion.
+
 Local files can be placed in:
 
 ```text
@@ -150,15 +165,40 @@ data/local/
 Supported local formats:
 
 - `.txt`: one document per file
-- `.jsonl`: one JSON object per line with a `text` field
+- `.jsonl`: one JSON object per line with either `text`, `prompt` + `completion`, or `messages`
+
+Structured JSONL records are preserved through cleaning and deduplication. During tokenization Jarvis renders them with role tags such as `<|user|>` and `<|assistant|>`, then masks the prompt labels with `-100` so Q/A and chat steps train the answer instead of learning to repeat the question.
 
 The smart launcher uses Hugging Face in `auto` mode by default: it runs a quick download preflight and skips Hub sources if the network resets.
-Hugging Face is used for modern data-only sources such as FineWeb2 Italian and StackExchange; Wikimedia direct remains the default Wikipedia source.
+Hugging Face is used for FineWeb2 IT, structured Italian Q/A, reasoning, chat/instruction data, and automotive sources. Wikipedia IT for the staged corpus step is collected directly from Wikimedia dumps.
 To force direct/local-only sources:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\jarvis.ps1 -HuggingFace 0
 ```
+
+Run the ordered staged pipeline from zero. Each command runs exactly one step and then stops:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -FromScratch -Step step_0_prepare
+```
+
+The staged launcher uses `-DataScale full` by default. For quick checks use `-DataScale dev`; for the largest streaming run use `-DataScale max`.
+`step_0_prepare` is the only step that builds, cleans, deduplicates, tokenizes, and packs datasets. Training steps only load their already packed shards and train.
+Each stage also declares a data profile and allowed sample formats, so raw text, Q/A, choice Q/A, instruction, and chat records are normalized, cleaned, tokenized, and filtered differently.
+
+After you verify the completed step and its official checkpoint, launch the next one manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -Step step_1_italian_corpus
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -Step step_2_italian_sft
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -Step step_3_context_logic
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -Step step_4_technical_automotive
+powershell -ExecutionPolicy Bypass -File .\scripts\jarvis_pipeline.ps1 -Step step_5_personality
+```
+
+The staged pipeline is defined in `config/training_pipeline.yaml`.
+Step 1 is only plain Italian corpus text (`wikipedia_it_wikimedia_direct` and `fineweb2_it`). Step 2 uses structured Italian syntax/Q&A data (`squad_it`, `piqa_italian`, and local records). Step 3 is the intermediate chat/logical instruction step (`evol_instruct_italian`, plus Q/A reinforcement).
 
 The launcher stores a data fingerprint next to packed shards. If `data/local/`, `data_pipeline/`, or data path config changes, Jarvis rebuilds the generated dataset only when no checkpoint is being resumed or when you explicitly run from scratch. Existing checkpoints keep using the existing packed dataset until you choose:
 
@@ -217,6 +257,14 @@ Then browse to:
 http://127.0.0.1:8765
 ```
 
+The model test UI is served by the same Next.js app:
+
+```text
+http://127.0.0.1:8765/test-model
+```
+
+Browser requests go through the Next API under `/api/model/*`; Next keeps the Python model worker behind the dashboard server.
+
 <p align="center">
   <img src="./asset/divider.gif" width="440" height="40" />
 </p>
@@ -254,18 +302,20 @@ The generated directories are intentionally ignored by Git.
   <img src="./asset/divider.gif" width="440" height="40" />
 </p>
 
-## <img src="./asset/icon4.gif" width="48px" /> Automotive Direction
+## <img src="./asset/icon4.gif" width="48px" /> Training Direction
 
 The first objective is to make the full training path complete reliably.
-After that, Jarvis should move from generic Italian text toward high-value automotive data:
+After that, Jarvis should move through ordered training phases without mixing closed datasets:
 
-- OBD and DTC code explanations
-- ECU, sensors, actuators, and diagnostic flows
-- Maintenance procedures
-- Fault symptoms, likely causes, and validation tests
-- Workshop notes and structured Q/A examples
+- Step 0: prepare database, tokenizer, vocabulary, structured sample schema, and all packed training datasets
+- Step 1: train only plain Italian corpus text from Wikipedia IT and FineWeb2 IT
+- Step 2: train Italian syntax, sentence logic, and Q/A behavior after the corpus pass
+- Step 3: intermediate chat, instruction following, context handling, and logical responses
+- Step 4: add automotive and real technical assistance data such as OBD/OBD2, diagnostics, faults, and maintenance
+- Step 5: apply final premium assistant personality only after the technical model is stable
 
-The strongest version of Jarvis will likely come from a general Italian base plus a focused automotive fine-tuning pass.
+Every completed training step publishes an official checkpoint under `checkpoints/official/`.
+If a later step degrades the model, restart from the previous official checkpoint instead of rewriting earlier stages.
 
 <p align="center">
   <img src="./asset/divider.gif" width="440" height="40" />

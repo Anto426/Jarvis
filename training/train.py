@@ -6,21 +6,30 @@ import torch
 import json
 import shutil
 import importlib.util
+import sys
 from datetime import datetime, timezone
+from functools import partial
 from tqdm import tqdm
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
+from safetensors.torch import load_file as load_safetensors
 
 from models.init_model import initialize_model
-from training.dataset import load_training_dataset
+from training.cpu_topology import (
+    detect_cpu_topology,
+    select_logical_processors,
+    set_process_affinity,
+    set_process_priority,
+    summarize_cpu_topology,
+)
+from training.dataset import causal_lm_collate, load_training_dataset
+from training.optim import CPUAdamW
 from training.scheduler import build_scheduler
 from training.utils import count_parameters
 from training.paths import configure_cache_env, get_path
 
 
-SAVE_EVERY_MINUTES = 5
-SAVE_INTERVAL = SAVE_EVERY_MINUTES * 60
 INTERRUPT_REQUESTED = False
 
 
@@ -29,6 +38,65 @@ def env_flag(name, default=False):
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_float(name, default=None):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    return float(value)
+
+
+def env_int(name, default=None):
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    return int(value)
+
+
+def resolve_cpu_thread_value(value, selected_count, total_logical, default=None):
+    if value is None:
+        return default
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "default", "none", "off"}:
+            return default
+        if normalized in {"auto", "selected", "policy"}:
+            return max(1, selected_count)
+        if normalized in {"all", "max"}:
+            return max(1, total_logical)
+        value = normalized
+
+    value = int(value)
+    if value <= 0:
+        return default
+    return value
+
+
+def cpu_core_policy(train_cfg):
+    return os.environ.get(
+        "JARVIS_CPU_CORE_POLICY",
+        train_cfg.get("cpu_core_policy", "all_cores"),
+    )
+
+
+def load_pipeline_step_metadata():
+    step_id = os.environ.get("JARVIS_PIPELINE_STEP_ID")
+    if not step_id:
+        return {}
+
+    return {
+        "id": step_id,
+        "order": os.environ.get("JARVIS_PIPELINE_STEP_ORDER"),
+        "title": os.environ.get("JARVIS_PIPELINE_STEP_TITLE"),
+        "objective": os.environ.get("JARVIS_PIPELINE_STEP_OBJECTIVE"),
+        "requires": os.environ.get("JARVIS_PIPELINE_STEP_REQUIRES"),
+        "data_profile": os.environ.get("JARVIS_DATA_PROFILE"),
+        "allowed_formats": os.environ.get("JARVIS_ALLOWED_FORMATS"),
+        "raw_include": os.environ.get("JARVIS_RAW_INCLUDE"),
+        "shards_dir": os.environ.get("JARVIS_PATH_SHARDS_DIR"),
+    }
 
 
 def format_duration(seconds):
@@ -55,6 +123,16 @@ def cuda_memory_gb():
     return allocated, reserved
 
 
+def cuda_reserved_fraction():
+    if not torch.cuda.is_available():
+        return 0.0
+
+    total = torch.cuda.get_device_properties(0).total_memory
+    if total <= 0:
+        return 0.0
+    return torch.cuda.memory_reserved() / total
+
+
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -66,7 +144,25 @@ def write_json_atomic(path, payload):
     tmp_path.replace(path)
 
 
-def init_metrics(logs_dir, train_cfg, total_steps, start_global_step):
+def console_print(message=""):
+    print(message, flush=True)
+
+
+def early_startup_banner():
+    console_print("")
+    console_print("=" * 78)
+    console_print("JARVIS TRAIN.PY BOOT")
+    console_print("=" * 78)
+    console_print(f"Time UTC: {utc_now_iso()}")
+    console_print(f"PID: {os.getpid()} | PPID: {os.getppid() if hasattr(os, 'getppid') else '-'}")
+    console_print(f"Python: {sys.executable}")
+    console_print(f"Working dir: {os.getcwd()}")
+    console_print("train.py entrato in main(): carico config, dataset, modello e checkpoint...")
+    console_print("=" * 78)
+    console_print("")
+
+
+def init_metrics(logs_dir, train_cfg, total_steps, start_global_step, pipeline_step=None):
     metrics_path = logs_dir / "training_metrics.json"
     previous = {}
     if metrics_path.exists():
@@ -76,15 +172,18 @@ def init_metrics(logs_dir, train_cfg, total_steps, start_global_step):
         except (OSError, json.JSONDecodeError):
             previous = {}
 
+    previous_step_id = (previous.get("pipeline_step") or {}).get("id")
+    current_step_id = (pipeline_step or {}).get("id")
+    same_pipeline_step = bool(current_step_id and previous_step_id == current_step_id)
     timestamp = utc_now_iso()
-    history = previous.get("history", [])
-    epochs = previous.get("epochs", [])
+    history = previous.get("history", []) if same_pipeline_step else []
+    epochs = previous.get("epochs", []) if same_pipeline_step else []
     if not isinstance(history, list):
         history = []
     if not isinstance(epochs, list):
         epochs = []
 
-    current = previous.get("current", {})
+    current = previous.get("current", {}) if same_pipeline_step else {}
     if not isinstance(current, dict):
         current = {}
     current = {
@@ -97,11 +196,12 @@ def init_metrics(logs_dir, train_cfg, total_steps, start_global_step):
 
     metrics = {
         "schema_version": 1,
-        "created_at": previous.get("created_at", timestamp),
+        "created_at": previous.get("created_at", timestamp) if same_pipeline_step else timestamp,
         "updated_at": timestamp,
         "status": "running",
         "total_steps": total_steps,
         "start_global_step": start_global_step,
+        "pipeline_step": pipeline_step or previous.get("pipeline_step", {}),
         "current": current,
         "config": {
             "num_train_epochs": int(train_cfg["num_train_epochs"]),
@@ -109,8 +209,18 @@ def init_metrics(logs_dir, train_cfg, total_steps, start_global_step):
             "gradient_accumulation_steps": int(train_cfg["gradient_accumulation_steps"]),
             "learning_rate": float(train_cfg["learning_rate"]),
             "eval_steps": int(train_cfg["eval_steps"]),
+            "eval_max_batches": train_cfg.get("eval_max_batches"),
             "logging_steps": int(train_cfg.get("logging_steps", 50)),
             "max_steps": train_cfg.get("max_steps"),
+            "save_steps": train_cfg.get("save_steps"),
+            "save_every_minutes": train_cfg.get("save_every_minutes"),
+            "cpu_optimizer": cpu_optimizer_mode(train_cfg),
+            "cpu_optimizer_vram_threshold": train_cfg.get("cpu_optimizer_vram_threshold"),
+            "cpu_threads": train_cfg.get("cpu_threads"),
+            "cpu_interop_threads": train_cfg.get("cpu_interop_threads"),
+            "cpu_core_policy": train_cfg.get("cpu_core_policy"),
+            "cpu_priority": train_cfg.get("cpu_priority"),
+            "pipeline_step": (pipeline_step or {}).get("id"),
         },
         "history": history,
         "epochs": epochs,
@@ -155,7 +265,11 @@ def override_from_env(train_cfg):
         "JARVIS_BATCH_SIZE": "per_device_batch_size",
         "JARVIS_GRAD_ACCUM": "gradient_accumulation_steps",
         "JARVIS_DATALOADER_WORKERS": "dataloader_num_workers",
+        "JARVIS_DATALOADER_TIMEOUT": "dataloader_timeout",
+        "JARVIS_EVAL_MAX_BATCHES": "eval_max_batches",
         "JARVIS_MAX_STEPS": "max_steps",
+        "JARVIS_MAX_SEQUENCE_LENGTH": "max_sequence_length",
+        "JARVIS_SAVE_STEPS": "save_steps",
     }
     for env_name, cfg_name in overrides.items():
         value = os.environ.get(env_name)
@@ -183,7 +297,113 @@ def configure_cuda_fast_path(train_cfg):
                 fn(True)
 
 
+def configure_cpu_fast_path(train_cfg):
+    topology = detect_cpu_topology()
+    selected_logical, applied_policy = select_logical_processors(
+        topology,
+        cpu_core_policy(train_cfg),
+    )
+    total_logical = int(topology.get("total_logical", os.cpu_count() or 1))
+    affinity_applied = env_flag(
+        "JARVIS_CPU_AFFINITY",
+        bool(train_cfg.get("cpu_affinity", True)),
+    ) and set_process_affinity(selected_logical)
+
+    cpu_threads = resolve_cpu_thread_value(
+        os.environ.get("JARVIS_CPU_THREADS", train_cfg.get("cpu_threads")),
+        selected_count=len(selected_logical),
+        total_logical=total_logical,
+        default=None,
+    )
+    cpu_interop_threads = resolve_cpu_thread_value(
+        os.environ.get("JARVIS_CPU_INTEROP_THREADS", train_cfg.get("cpu_interop_threads")),
+        selected_count=len(selected_logical),
+        total_logical=total_logical,
+        default=None,
+    )
+
+    if cpu_threads and cpu_threads > 0:
+        cpu_threads = min(cpu_threads, max(1, len(selected_logical)))
+        torch.set_num_threads(cpu_threads)
+        for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ.setdefault(env_name, str(cpu_threads))
+
+    if cpu_interop_threads and cpu_interop_threads > 0:
+        try:
+            torch.set_num_interop_threads(cpu_interop_threads)
+        except RuntimeError:
+            pass
+
+    priority = os.environ.get("JARVIS_CPU_PRIORITY", train_cfg.get("cpu_priority", "normal"))
+    priority_applied = set_process_priority(priority)
+    summary = summarize_cpu_topology(
+        topology,
+        selected_logical,
+        applied_policy,
+        affinity_applied,
+        priority,
+    )
+
+    return {
+        "cpu_threads": torch.get_num_threads(),
+        "cpu_interop_threads": torch.get_num_interop_threads(),
+        "cpu_topology": summary,
+        "priority_applied": priority_applied,
+    }
+
+
+def cpu_optimizer_mode(train_cfg):
+    value = os.environ.get("JARVIS_CPU_OPTIMIZER", train_cfg.get("cpu_optimizer", False))
+    if isinstance(value, bool):
+        return "always" if value else "off"
+
+    value = str(value).strip().lower()
+    if value in {"1", "true", "yes", "on", "always"}:
+        return "always"
+    if value in {"auto", "threshold", "limit"}:
+        return "auto"
+    return "off"
+
+
+def cpu_optimizer_vram_threshold(train_cfg):
+    return env_float(
+        "JARVIS_CPU_OPTIMIZER_VRAM_THRESHOLD",
+        float(train_cfg.get("cpu_optimizer_vram_threshold", 0.9)),
+    )
+
+
+def cpu_optimizer_check_steps(train_cfg):
+    return max(
+        1,
+        env_int(
+            "JARVIS_CPU_OPTIMIZER_CHECK_STEPS",
+            int(train_cfg.get("cpu_optimizer_check_steps", 1)),
+        ),
+    )
+
+
+def cpu_optimizer_auto_due(train_cfg, global_step):
+    mode = cpu_optimizer_mode(train_cfg)
+    if mode != "auto" or not torch.cuda.is_available():
+        return False
+
+    check_steps = cpu_optimizer_check_steps(train_cfg)
+    if global_step > 0 and global_step % check_steps != 0:
+        return False
+
+    return cuda_reserved_fraction() >= cpu_optimizer_vram_threshold(train_cfg)
+
+
 def build_adamw(model, train_cfg, optimizer_kwargs):
+    if cpu_optimizer_mode(train_cfg) == "always":
+        return CPUAdamW(
+            model.parameters(),
+            lr=float(train_cfg["learning_rate"]),
+            betas=tuple(train_cfg["betas"]),
+            eps=float(train_cfg["eps"]),
+            weight_decay=float(train_cfg["weight_decay"]),
+        )
+
     return AdamW(
         model.parameters(),
         lr=float(train_cfg["learning_rate"]),
@@ -192,6 +412,73 @@ def build_adamw(model, train_cfg, optimizer_kwargs):
         weight_decay=float(train_cfg["weight_decay"]),
         **optimizer_kwargs,
     )
+
+
+def unwrap_optimizer(optimizer):
+    return getattr(optimizer, "optimizer", optimizer)
+
+
+def cpu_optimizer_from_existing(raw_optimizer, train_cfg):
+    param_groups = []
+    for group in raw_optimizer.param_groups:
+        copied = {key: value for key, value in group.items() if key != "params"}
+        copied["params"] = group["params"]
+        param_groups.append(copied)
+
+    cpu_optimizer = CPUAdamW(
+        param_groups,
+        lr=float(train_cfg["learning_rate"]),
+        betas=tuple(train_cfg["betas"]),
+        eps=float(train_cfg["eps"]),
+        weight_decay=float(train_cfg["weight_decay"]),
+    )
+    cpu_optimizer.load_state_dict(raw_optimizer.state_dict())
+    return cpu_optimizer
+
+
+def replace_accelerator_optimizer(accelerator, old_optimizer, new_optimizer):
+    optimizers = getattr(accelerator, "_optimizers", None)
+    if optimizers is None:
+        return
+
+    accelerator._optimizers = [
+        new_optimizer if optimizer is old_optimizer else optimizer
+        for optimizer in optimizers
+        if optimizer is not new_optimizer
+    ]
+
+
+def bind_scheduler_to_optimizer(scheduler, optimizer):
+    raw_optimizer = unwrap_optimizer(optimizer)
+    raw_scheduler = getattr(scheduler, "scheduler", scheduler)
+    if hasattr(raw_scheduler, "optimizer"):
+        raw_scheduler.optimizer = raw_optimizer
+    if hasattr(scheduler, "optimizers"):
+        scheduler.optimizers = [optimizer]
+
+
+def switch_to_cpu_optimizer(accelerator, optimizer, scheduler, train_cfg):
+    raw_optimizer = unwrap_optimizer(optimizer)
+    cpu_optimizer = cpu_optimizer_from_existing(raw_optimizer, train_cfg)
+
+    if hasattr(accelerator, "_optimizers"):
+        accelerator._optimizers = [
+            registered
+            for registered in accelerator._optimizers
+            if registered is not optimizer
+        ]
+
+    prepared_optimizer = accelerator.prepare_optimizer(
+        cpu_optimizer,
+        device_placement=False,
+    )
+    replace_accelerator_optimizer(accelerator, optimizer, prepared_optimizer)
+    bind_scheduler_to_optimizer(scheduler, prepared_optimizer)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return prepared_optimizer, scheduler
 
 
 def get_autocast_dtype(mixed_precision):
@@ -359,6 +646,14 @@ def cleanup_staging_checkpoints(checkpoint_dir):
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def clear_active_checkpoints(checkpoint_dir):
+    if not checkpoint_dir.exists():
+        return
+    for checkpoint in checkpoint_dir.glob("step_*"):
+        if checkpoint.is_dir():
+            shutil.rmtree(checkpoint, ignore_errors=True)
+
+
 def get_latest_checkpoint(checkpoint_dir):
     checkpoints = get_candidate_checkpoints(checkpoint_dir)
     return checkpoints[0] if checkpoints else None
@@ -402,7 +697,61 @@ def get_candidate_checkpoints(checkpoint_dir):
     return valid_checkpoints
 
 
-def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints):
+def checkpoint_meta_path(checkpoint):
+    return checkpoint / "jarvis_checkpoint_meta.json"
+
+
+def read_checkpoint_meta(checkpoint):
+    path = checkpoint_meta_path(checkpoint)
+    if not path.exists():
+        return {}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def checkpoint_pipeline_step_id(checkpoint):
+    meta = read_checkpoint_meta(checkpoint)
+    pipeline_step = meta.get("pipeline_step") if isinstance(meta, dict) else None
+    if isinstance(pipeline_step, dict):
+        return pipeline_step.get("id")
+    return None
+
+
+def write_checkpoint_meta(checkpoint, step, pipeline_step=None, checkpoint_mode="full_state"):
+    meta = {
+        "schema_version": 1,
+        "checkpoint_step": step,
+        "checkpoint_mode": checkpoint_mode,
+        "saved_at": utc_now_iso(),
+        "pipeline_step": pipeline_step or {},
+    }
+    with checkpoint_meta_path(checkpoint).open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def load_model_weights_from_checkpoint(model, checkpoint):
+    safetensors_path = checkpoint / "model.safetensors"
+    torch_path = checkpoint / "pytorch_model.bin"
+
+    if safetensors_path.exists():
+        state_dict = load_safetensors(str(safetensors_path), device="cpu")
+    elif torch_path.exists():
+        state_dict = torch.load(torch_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(f"Nessun file modello trovato in {checkpoint}")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    return {
+        "missing": len(missing),
+        "unexpected": len(unexpected),
+    }
+
+
+def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints, pipeline_step=None):
     save_path = checkpoint_dir / f"step_{step}"
     tmp_path = checkpoint_dir / f"step_{step}.tmp"
 
@@ -414,10 +763,222 @@ def save_checkpoint(accelerator, step, checkpoint_dir, max_checkpoints):
     tmp_path.mkdir(parents=True, exist_ok=True)
 
     accelerator.save_state(str(tmp_path), safe_serialization=False)
+    write_checkpoint_meta(tmp_path, step, pipeline_step=pipeline_step)
     tmp_path.replace(save_path)
     rotate_checkpoints(checkpoint_dir, max_checkpoints)
 
     accelerator.print(f"\nCheckpoint salvato: {save_path}\n")
+
+
+def checkpoint_due(global_step, last_saved_step, current_time, last_save_time, train_cfg):
+    if global_step <= 0 or global_step == last_saved_step:
+        return False
+
+    save_steps = train_cfg.get("save_steps")
+    if save_steps is not None:
+        save_steps = int(save_steps)
+        if save_steps > 0 and global_step % save_steps == 0:
+            return True
+
+    save_every_minutes = env_float(
+        "JARVIS_SAVE_EVERY_MINUTES",
+        train_cfg.get("save_every_minutes"),
+    )
+    if save_every_minutes is not None and save_every_minutes > 0:
+        return current_time - last_save_time >= save_every_minutes * 60
+
+    return False
+
+
+def next_checkpoint_step(global_step, train_cfg):
+    save_steps = train_cfg.get("save_steps")
+    if save_steps is None:
+        return None
+
+    save_steps = int(save_steps)
+    if save_steps <= 0:
+        return None
+
+    return ((global_step // save_steps) + 1) * save_steps
+
+
+def cuda_startup_lines():
+    if not torch.cuda.is_available():
+        return ["CUDA: non disponibile"]
+
+    lines = [
+        f"CUDA: torch={torch.version.cuda} | devices={torch.cuda.device_count()} | "
+        f"current={torch.cuda.current_device()}",
+        f"CUDA bf16 support: {torch.cuda.is_bf16_supported()}",
+    ]
+    for index in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(index)
+        total_gb = props.total_memory / 1024**3
+        lines.append(
+            f"GPU {index}: {props.name} | total_vram={total_gb:.1f}GB | "
+            f"sm={props.major}.{props.minor}"
+        )
+
+    allocated_gb, reserved_gb = cuda_memory_gb()
+    lines.append(
+        f"CUDA memory now: allocated={allocated_gb:.2f}GB | "
+        f"reserved={reserved_gb:.2f}GB | reserved_ratio={cuda_reserved_fraction() * 100:.1f}%"
+    )
+    return lines
+
+
+def dataloader_workers(loader):
+    for name in ("num_workers",):
+        value = getattr(loader, name, None)
+        if value is not None:
+            return value
+
+    for name in ("base_dataloader", "dataloader"):
+        nested = getattr(loader, name, None)
+        value = getattr(nested, "num_workers", None)
+        if value is not None:
+            return value
+
+    return "?"
+
+
+def startup_summary(
+    accelerator,
+    train_cfg,
+    pipeline_step,
+    dataset,
+    val_dataset,
+    train_loader,
+    val_loader,
+    model,
+    optimizer,
+    checkpoint_dir,
+    logs_dir,
+    metrics_path,
+    total_steps,
+    global_step,
+    accumulation_steps,
+    mixed_precision,
+    attention_impl,
+    cpu_runtime,
+    cpu_optimizer_setting,
+    cpu_optimizer_active,
+    fused_optimizer,
+    compile_model,
+    restore_weights_only,
+    restored_checkpoint,
+    loaded_weights_checkpoint,
+    max_sequence_length,
+    truncation_keep,
+    eval_max_batches,
+    slow_step_seconds,
+    status_update_seconds,
+    max_checkpoints,
+):
+    if not accelerator.is_main_process:
+        return
+
+    raw_optimizer = unwrap_optimizer(optimizer)
+    model_params = count_parameters(model)
+    effective_batch = (
+        int(train_cfg["per_device_batch_size"])
+        * int(accumulation_steps)
+        * int(accelerator.num_processes)
+    )
+    next_save = next_checkpoint_step(global_step, train_cfg)
+    cpu_topology = cpu_runtime["cpu_topology"]
+    selected_logical = ",".join(str(item) for item in cpu_topology["selected_logical"])
+    data_path = get_path("shards_dir", create=False)
+
+    lines = [
+        "",
+        "=" * 78,
+        "JARVIS TRAINING STARTUP",
+        "=" * 78,
+        f"Time UTC: {utc_now_iso()}",
+        f"Project root: {get_path('logs_dir').parents[0]}",
+        f"Stage: {(pipeline_step or {}).get('id', 'manual')} | "
+        f"{(pipeline_step or {}).get('title', 'training diretto')}",
+        f"Objective: {(pipeline_step or {}).get('objective', '-')}",
+        f"Data profile: {(pipeline_step or {}).get('data_profile', '-')} | "
+        f"allowed_formats={(pipeline_step or {}).get('allowed_formats', '-')}",
+        f"Shards dir: {data_path}",
+        f"Checkpoint dir: {checkpoint_dir}",
+        f"Logs dir: {logs_dir}",
+        f"Metrics file: {metrics_path}",
+        "-" * 78,
+        "HARDWARE",
+        *cuda_startup_lines(),
+        f"CPU: hybrid={cpu_topology['hybrid']} | policy={cpu_topology['policy']} | "
+        f"selected={cpu_topology['selected_count']}/{cpu_topology['total_logical']} | "
+        f"P={cpu_topology['performance_count']} | E={cpu_topology['efficient_count']} | "
+        f"parked={cpu_topology['parked_count']}",
+        f"CPU affinity={cpu_topology['affinity_applied']} | priority={cpu_topology['priority']} | "
+        f"priority_applied={cpu_runtime['priority_applied']}",
+        f"CPU threads={cpu_runtime['cpu_threads']} | interop={cpu_runtime['cpu_interop_threads']} | "
+        f"selected_logical=[{selected_logical}]",
+        "-" * 78,
+        "MODEL / PRECISION",
+        f"Model params: {model_params / 1e6:.2f}M",
+        f"Attention: {attention_impl}",
+        f"Mixed precision: {mixed_precision}",
+        f"Gradient checkpointing: {bool(train_cfg['gradient_checkpointing'])}",
+        f"TF32: {bool(train_cfg.get('tf32', True))}",
+        f"torch.compile requested: {compile_model}",
+        f"CUDA fast optimizer fused: {bool(fused_optimizer)}",
+        "-" * 78,
+        "OPTIMIZER / SCHEDULER",
+        f"Optimizer: {raw_optimizer.__class__.__name__}",
+        f"CPU optimizer mode: {cpu_optimizer_setting} | active_now={cpu_optimizer_active} | "
+        f"threshold={float(train_cfg.get('cpu_optimizer_vram_threshold', 0.9)) * 100:.1f}%",
+        f"LR: {float(train_cfg['learning_rate']):.3e} | betas={train_cfg['betas']} | "
+        f"eps={train_cfg['eps']} | weight_decay={train_cfg['weight_decay']}",
+        f"Scheduler: {train_cfg.get('scheduler', 'cosine')} | warmup_ratio={train_cfg['warmup_ratio']}",
+        f"Max grad norm: {train_cfg['max_grad_norm']}",
+        "-" * 78,
+        "DATA / BATCH",
+        f"Train records: {len(dataset)} | Val records: {len(val_dataset)}",
+        f"Train loader batches: {len(train_loader)} | Val loader batches: {len(val_loader)}",
+        f"Micro batch per device: {train_cfg['per_device_batch_size']} | "
+        f"grad_accum={accumulation_steps} | effective_batch={effective_batch}",
+        f"Eval batch size: {train_cfg['eval_batch_size']}",
+        f"Sequence cap: {max_sequence_length or 'off'} | truncation_keep={truncation_keep}",
+        f"Dataloader workers: train={dataloader_workers(train_loader)} | "
+        f"val={dataloader_workers(val_loader)} | "
+        f"pin_memory={bool(train_cfg['pin_memory'])} | drop_last={bool(train_cfg.get('drop_last', True))}",
+        "-" * 78,
+        "RUN CONTROL",
+        f"Epochs: {train_cfg['num_train_epochs']} | max_steps={train_cfg.get('max_steps')}",
+        f"Global step: {global_step}/{total_steps} | remaining={max(0, total_steps - global_step)}",
+        f"Save every steps: {train_cfg.get('save_steps')} | next_save={next_save} | "
+        f"save_total_limit={max_checkpoints}",
+        f"Save every minutes: {train_cfg.get('save_every_minutes')}",
+        f"Eval steps: {train_cfg['eval_steps']} | eval_max_batches={eval_max_batches}",
+        f"Status update seconds: {status_update_seconds} | slow_step_seconds={slow_step_seconds}",
+        "-" * 78,
+        "RESUME",
+        f"restore_weights_only={restore_weights_only}",
+        f"restored_state_checkpoint={restored_checkpoint or '-'}",
+        f"loaded_weights_checkpoint={loaded_weights_checkpoint or '-'}",
+        "-" * 78,
+        "ENV",
+        f"JARVIS_MIXED_PRECISION={os.environ.get('JARVIS_MIXED_PRECISION', '-')}",
+        f"JARVIS_CPU_OPTIMIZER={os.environ.get('JARVIS_CPU_OPTIMIZER', '-')}",
+        f"JARVIS_CPU_CORE_POLICY={os.environ.get('JARVIS_CPU_CORE_POLICY', '-')}",
+        f"JARVIS_MAX_SEQUENCE_LENGTH={os.environ.get('JARVIS_MAX_SEQUENCE_LENGTH', '-')}",
+        f"JARVIS_SAVE_STEPS={os.environ.get('JARVIS_SAVE_STEPS', '-')}",
+        f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '-')}",
+        "=" * 78,
+        "",
+    ]
+    text = "\n".join(lines)
+    console_print(text)
+
+    try:
+        startup_path = logs_dir / "training_startup.txt"
+        startup_path.write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def request_stop():
@@ -427,12 +988,15 @@ def request_stop():
 
 def main():
 
+    early_startup_banner()
     configure_cache_env()
     with open("config/training.yaml", "r") as f:
         train_cfg = yaml.safe_load(f)["training"]
+    pipeline_step = load_pipeline_step_metadata()
 
     override_from_env(train_cfg)
     configure_cuda_fast_path(train_cfg)
+    cpu_runtime = configure_cpu_fast_path(train_cfg)
 
     mixed_precision = resolve_mixed_precision(train_cfg["mixed_precision"])
     checkpoint_dir = get_path("model_output_dir", create=True)
@@ -450,6 +1014,29 @@ def main():
         model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
+    restore_weights_only = env_flag("JARVIS_RESTORE_WEIGHTS_ONLY", False)
+    loaded_weights_checkpoint = None
+    if restore_weights_only:
+        loaded_previous_weights = False
+        for checkpoint in get_candidate_checkpoints(checkpoint_dir):
+            print(f"\nCarico solo i pesi modello da {checkpoint}\n")
+            try:
+                result = load_model_weights_from_checkpoint(model, checkpoint)
+                loaded_previous_weights = True
+                loaded_weights_checkpoint = str(checkpoint)
+                print(
+                    "Pesi caricati, optimizer/scheduler/global_step resettati "
+                    f"(missing={result['missing']}, unexpected={result['unexpected']}).\n"
+                )
+                break
+            except Exception as exc:
+                print(f"Checkpoint non caricabile come pesi modello, lo salto: {checkpoint}")
+                print(f"Motivo: {exc}\n")
+        else:
+            print("\nNessun checkpoint precedente valido: training da zero.\n")
+        if loaded_previous_weights:
+            clear_active_checkpoints(checkpoint_dir)
+
     autotune_batch_size(model, train_cfg, mixed_precision)
 
     accumulation_steps = int(train_cfg["gradient_accumulation_steps"])
@@ -458,9 +1045,15 @@ def main():
         gradient_accumulation_steps=accumulation_steps,
     )
 
-    fused_optimizer = env_flag(
-        "JARVIS_FUSED_OPTIMIZER",
-        bool(train_cfg.get("fused_optimizer", True)),
+    cpu_optimizer_setting = cpu_optimizer_mode(train_cfg)
+    cpu_optimizer_active = cpu_optimizer_setting == "always"
+    cpu_optimizer_auto = cpu_optimizer_setting == "auto"
+    fused_optimizer = (
+        env_flag(
+            "JARVIS_FUSED_OPTIMIZER",
+            bool(train_cfg.get("fused_optimizer", True)),
+        )
+        and not cpu_optimizer_active
     )
     if fused_optimizer and torch.cuda.is_available():
         model.to(accelerator.device)
@@ -486,8 +1079,49 @@ def main():
         f"\nModel: {count_parameters(model)/1e6:.2f}M parameters | "
         f"attention={attention_impl}\n"
     )
+    if pipeline_step:
+        accelerator.print(
+            f"Pipeline step: {pipeline_step.get('id')} | {pipeline_step.get('title')}\n"
+        )
+    if cpu_optimizer_active:
+        accelerator.print(
+            "\nCPU optimizer attivo: stati AdamW su RAM di sistema. "
+            "Riduce VRAM ma rende optimizer.step piu lento.\n"
+        )
+    elif cpu_optimizer_auto:
+        accelerator.print(
+            "\nCPU optimizer auto: partenza su GPU, switch su CPU se VRAM reserved >= "
+            f"{cpu_optimizer_vram_threshold(train_cfg) * 100:.0f}%.\n"
+        )
+    accelerator.print(
+        "CPU runtime: "
+        f"threads={cpu_runtime['cpu_threads']} | "
+        f"interop={cpu_runtime['cpu_interop_threads']}\n"
+    )
+    cpu_topology = cpu_runtime["cpu_topology"]
+    accelerator.print(
+        "CPU topology: "
+        f"hybrid={cpu_topology['hybrid']} | "
+        f"policy={cpu_topology['policy']} | "
+        f"selected={cpu_topology['selected_count']}/{cpu_topology['total_logical']} | "
+        f"P={cpu_topology['performance_count']} | "
+        f"E={cpu_topology['efficient_count']} | "
+        f"parked={cpu_topology['parked_count']} | "
+        f"affinity={cpu_topology['affinity_applied']} | "
+        f"priority={cpu_topology['priority']}\n"
+    )
 
     num_workers = int(train_cfg["dataloader_num_workers"])
+    windows_safe_loader = env_flag("JARVIS_WINDOWS_SAFE_DATALOADER", os.name == "nt")
+    if windows_safe_loader and os.name == "nt" and num_workers > 0:
+        accelerator.print(
+            "\nWindows safe dataloader attivo: uso num_workers=0 per evitare stalli "
+            "multiprocessing con dataset Parquet/HF. Imposta JARVIS_WINDOWS_SAFE_DATALOADER=0 "
+            "per riabilitare i worker.\n"
+        )
+        num_workers = 0
+        train_cfg["dataloader_num_workers"] = 0
+
     loader_kwargs = {
         "num_workers": num_workers,
         "pin_memory": bool(train_cfg["pin_memory"]),
@@ -496,20 +1130,44 @@ def main():
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(train_cfg.get("persistent_workers", True))
         loader_kwargs["prefetch_factor"] = int(train_cfg.get("prefetch_factor", 4))
+        loader_kwargs["timeout"] = int(train_cfg.get("dataloader_timeout", 0))
+
+    max_sequence_length = train_cfg.get("max_sequence_length")
+    max_sequence_length = int(max_sequence_length) if max_sequence_length else None
+    truncation_keep = str(train_cfg.get("sequence_truncation_keep", "tail"))
+    collate_fn = partial(
+        causal_lm_collate,
+        max_sequence_length=max_sequence_length,
+        truncation_keep=truncation_keep,
+    )
+    if max_sequence_length:
+        accelerator.print(
+            "\nVRAM safe sequence cap attivo: "
+            f"max_sequence_length={max_sequence_length}, keep={truncation_keep}.\n"
+        )
 
     train_loader = DataLoader(
         dataset,
         batch_size=train_cfg["per_device_batch_size"],
         shuffle=True,
+        collate_fn=collate_fn,
         **loader_kwargs,
     )
+
+    val_workers = max(0, min(num_workers, 2))
+    val_loader_kwargs = {
+        "num_workers": val_workers,
+        "pin_memory": bool(train_cfg["pin_memory"]),
+    }
+    if val_workers > 0:
+        val_loader_kwargs["timeout"] = int(train_cfg.get("dataloader_timeout", 0))
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=train_cfg["eval_batch_size"],
         shuffle=False,
-        num_workers=max(0, min(num_workers, 2)),
-        pin_memory=bool(train_cfg["pin_memory"]),
+        collate_fn=collate_fn,
+        **val_loader_kwargs,
     )
 
     optimizer_kwargs = {}
@@ -538,29 +1196,45 @@ def main():
     )
 
     global_step = 0
+    restored_checkpoint = None
 
-    for checkpoint in get_candidate_checkpoints(checkpoint_dir):
-        accelerator.print(f"\nRipristino da {checkpoint}\n")
-        try:
-            accelerator.load_state(str(checkpoint))
-            global_step = int(checkpoint.name.split("_")[-1])
-            break
-        except Exception as exc:
-            accelerator.print(f"Checkpoint non caricabile, lo salto: {checkpoint}")
-            accelerator.print(f"Motivo: {exc}\n")
-            if accelerator.is_main_process:
-                marker = checkpoint / ".bad_checkpoint"
-                marker.write_text(str(exc), encoding="utf-8")
+    if restore_weights_only:
+        accelerator.print("\nNuovo stage: non ripristino optimizer, scheduler o global_step.\n")
     else:
-        accelerator.print("\nNessun checkpoint valido trovato: training da zero.\n")
+        current_step_id = pipeline_step.get("id") if pipeline_step else None
+        for checkpoint in get_candidate_checkpoints(checkpoint_dir):
+            checkpoint_step_id = checkpoint_pipeline_step_id(checkpoint)
+            if current_step_id and checkpoint_step_id and checkpoint_step_id != current_step_id:
+                accelerator.print(
+                    f"\nCheckpoint di un altro stage ignorato: {checkpoint} "
+                    f"({checkpoint_step_id} != {current_step_id})\n"
+                )
+                continue
+
+            accelerator.print(f"\nRipristino stato completo da {checkpoint}\n")
+            try:
+                accelerator.load_state(str(checkpoint))
+                global_step = int(checkpoint.name.split("_")[-1])
+                restored_checkpoint = str(checkpoint)
+                break
+            except Exception as exc:
+                accelerator.print(f"Checkpoint non caricabile, lo salto: {checkpoint}")
+                accelerator.print(f"Motivo: {exc}\n")
+                if accelerator.is_main_process:
+                    marker = checkpoint / ".bad_checkpoint"
+                    marker.write_text(str(exc), encoding="utf-8")
+        else:
+            accelerator.print("\nNessun checkpoint valido trovato: training da zero.\n")
 
     last_save_time = time.time()
+    last_saved_step = global_step
     status_start_time = last_save_time
     last_status_time = last_save_time
     last_status_tokens = 0
     last_status_micro_steps = 0
     session_tokens = 0
     session_micro_steps = 0
+    accumulation_tokens = 0
     session_start_global_step = global_step
     last_loss = None
     last_ppl = None
@@ -571,14 +1245,58 @@ def main():
     max_steps = train_cfg.get("max_steps")
     max_steps = int(max_steps) if max_steps is not None else None
     logging_steps = max(1, int(train_cfg.get("logging_steps", 50)))
+    eval_max_batches = train_cfg.get("eval_max_batches")
+    eval_max_batches = int(eval_max_batches) if eval_max_batches is not None else None
+    slow_step_seconds = float(train_cfg.get("slow_step_seconds", 60))
+    slow_step_seconds = env_float("JARVIS_SLOW_STEP_SECONDS", slow_step_seconds)
 
     logs_dir = get_path("logs_dir", create=True)
     metrics_path = None
     metrics = None
     if accelerator.is_main_process:
-        metrics_path, metrics = init_metrics(logs_dir, train_cfg, total_steps, global_step)
+        metrics_path, metrics = init_metrics(
+            logs_dir,
+            train_cfg,
+            total_steps,
+            global_step,
+            pipeline_step=pipeline_step,
+        )
         accelerator.print(f"\nMetriche training: {metrics_path}\n")
     metrics_final_status = "completed"
+
+    startup_summary(
+        accelerator=accelerator,
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        dataset=dataset,
+        val_dataset=val_dataset,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        model=model,
+        optimizer=optimizer,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+        metrics_path=metrics_path,
+        total_steps=total_steps,
+        global_step=global_step,
+        accumulation_steps=accumulation_steps,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        cpu_runtime=cpu_runtime,
+        cpu_optimizer_setting=cpu_optimizer_setting,
+        cpu_optimizer_active=cpu_optimizer_active,
+        fused_optimizer=fused_optimizer,
+        compile_model=compile_model,
+        restore_weights_only=restore_weights_only,
+        restored_checkpoint=restored_checkpoint,
+        loaded_weights_checkpoint=loaded_weights_checkpoint,
+        max_sequence_length=max_sequence_length,
+        truncation_keep=truncation_keep,
+        eval_max_batches=eval_max_batches,
+        slow_step_seconds=slow_step_seconds,
+        status_update_seconds=status_update_seconds,
+        max_checkpoints=max_checkpoints,
+    )
 
     try:
 
@@ -595,27 +1313,52 @@ def main():
                 dynamic_ncols=True
             )
 
+            last_batch_end_time = time.time()
             for step, batch in enumerate(progress):
+                batch_ready_time = time.time()
+                fetch_seconds = batch_ready_time - last_batch_end_time
+                compute_start_time = batch_ready_time
+
                 if INTERRUPT_REQUESTED:
                     accelerator.print("\nStop richiesto: salvo checkpoint e chiudo.\n")
                     metrics_final_status = "interrupted"
-                    return
+                    raise KeyboardInterrupt
 
                 with accelerator.accumulate(model):
                     with accelerator.autocast():
 
                         outputs = model(
                             input_ids=batch["input_ids"],
-                            labels=batch["input_ids"]
+                            attention_mask=batch.get("attention_mask"),
+                            labels=batch.get("labels", batch["input_ids"]),
                         )
 
                         loss = outputs.loss
 
                     accelerator.backward(loss)
-                    batch_tokens = batch["input_ids"].numel()
+                    compute_seconds = time.time() - compute_start_time
+                    batch_tokens = (
+                        batch["attention_mask"].sum().item()
+                        if "attention_mask" in batch
+                        else batch["input_ids"].numel()
+                    )
                     session_tokens += batch_tokens
+                    accumulation_tokens += batch_tokens
                     session_micro_steps += 1
                     current_time = time.time()
+
+                    if slow_step_seconds and (
+                        fetch_seconds >= slow_step_seconds
+                        or compute_seconds >= slow_step_seconds
+                    ):
+                        seq_len = int(batch["input_ids"].shape[-1])
+                        batch_size = int(batch["input_ids"].shape[0])
+                        accelerator.print(
+                            "\nBatch lento rilevato | "
+                            f"GS {global_step} | micro {step} | "
+                            f"fetch {fetch_seconds:.1f}s | compute {compute_seconds:.1f}s | "
+                            f"batch {batch_size} | seq {seq_len} | tokens {batch_tokens}\n"
+                        )
 
                     if (
                         current_time - last_status_time >= status_update_seconds
@@ -656,6 +1399,26 @@ def main():
 
                     if accelerator.sync_gradients:
 
+                        if (
+                            cpu_optimizer_auto
+                            and not cpu_optimizer_active
+                            and cpu_optimizer_auto_due(train_cfg, global_step)
+                        ):
+                            reserved_fraction = cuda_reserved_fraction()
+                            accelerator.print(
+                                "\nSoglia VRAM raggiunta: passo a CPU optimizer | "
+                                f"reserved {reserved_fraction * 100:.1f}% >= "
+                                f"{cpu_optimizer_vram_threshold(train_cfg) * 100:.1f}%\n"
+                            )
+                            optimizer, scheduler = switch_to_cpu_optimizer(
+                                accelerator,
+                                optimizer,
+                                scheduler,
+                                train_cfg,
+                            )
+                            cpu_optimizer_active = True
+
+                        optimizer_started = time.time()
                         accelerator.clip_grad_norm_(
                             model.parameters(),
                             train_cfg["max_grad_norm"]
@@ -664,6 +1427,14 @@ def main():
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
+                        optimizer_seconds = time.time() - optimizer_started
+
+                        if slow_step_seconds and optimizer_seconds >= slow_step_seconds:
+                            accelerator.print(
+                                "\nOptimizer lento rilevato | "
+                                f"GS {global_step} | optimizer {optimizer_seconds:.1f}s | "
+                                f"cpu_optimizer={cpu_optimizer_active}\n"
+                            )
 
                         global_step += 1
 
@@ -674,7 +1445,8 @@ def main():
                         epoch_loss_total += avg_loss
                         epoch_loss_count += 1
 
-                        tokens = batch["input_ids"].numel() * accumulation_steps
+                        tokens = accumulation_tokens
+                        accumulation_tokens = 0
                         allocated_gb, reserved_gb = cuda_memory_gb()
 
                         progress.set_description(
@@ -703,20 +1475,36 @@ def main():
                                     "tokens": tokens,
                                     "vram_allocated_gb": allocated_gb,
                                     "vram_reserved_gb": reserved_gb,
+                                    "optimizer_step_seconds": optimizer_seconds,
+                                    "cpu_optimizer_active": cpu_optimizer_active,
                                 },
                             )
 
-                        # SAVE A TEMPO
+                        # CHECKPOINT
                         current_time = time.time()
-                        if current_time - last_save_time >= SAVE_INTERVAL:
+                        if checkpoint_due(
+                            global_step,
+                            last_saved_step,
+                            current_time,
+                            last_save_time,
+                            train_cfg,
+                        ):
                             if accelerator.is_main_process:
+                                checkpoint_started = time.time()
                                 save_checkpoint(
                                     accelerator,
                                     global_step,
                                     checkpoint_dir,
-                                    max_checkpoints
+                                    max_checkpoints,
+                                    pipeline_step=pipeline_step,
                                 )
-                            last_save_time = current_time
+                                checkpoint_seconds = time.time() - checkpoint_started
+                                accelerator.print(
+                                    f"Checkpoint step {global_step} completato in "
+                                    f"{format_duration(checkpoint_seconds)}.\n"
+                                )
+                            last_save_time = time.time()
+                            last_saved_step = global_step
 
                         # VALIDATION
                         if global_step % train_cfg["eval_steps"] == 0:
@@ -724,24 +1512,34 @@ def main():
                             model.eval()
                             eval_loss = 0
                             eval_steps = 0
+                            eval_started = time.time()
 
                             with torch.no_grad():
                                 for val_batch in val_loader:
+                                    if eval_max_batches and eval_steps >= eval_max_batches:
+                                        break
                                     with accelerator.autocast():
                                         val_out = model(
                                             input_ids=val_batch["input_ids"],
-                                            labels=val_batch["input_ids"]
+                                            attention_mask=val_batch.get("attention_mask"),
+                                            labels=val_batch.get("labels", val_batch["input_ids"]),
                                         )
                                     eval_loss += val_out.loss.item()
                                     eval_steps += 1
 
-                            eval_loss /= eval_steps
+                            eval_loss /= max(eval_steps, 1)
                             eval_ppl = math.exp(min(eval_loss, 20))
+                            eval_seconds = time.time() - eval_started
+                            eval_limit = ""
+                            if eval_max_batches:
+                                eval_limit = f" | batches {eval_steps}/{eval_max_batches}"
 
                             accelerator.print(
                                 f"\nValidation | "
                                 f"Loss {eval_loss:.4f} | "
-                                f"PPL {eval_ppl:.2f}\n"
+                                f"PPL {eval_ppl:.2f} | "
+                                f"Durata {format_duration(eval_seconds)}"
+                                f"{eval_limit}\n"
                             )
 
                             if accelerator.is_main_process:
@@ -756,6 +1554,8 @@ def main():
                                         "loss": eval_loss,
                                         "perplexity": eval_ppl,
                                         "learning_rate": current_lr,
+                                        "eval_batches": eval_steps,
+                                        "duration_seconds": eval_seconds,
                                     },
                                 )
 
@@ -779,6 +1579,8 @@ def main():
                                 )
                                 metrics_final_status = "stopped_at_max_steps"
                             return
+
+                last_batch_end_time = time.time()
 
             if accelerator.is_main_process:
                 avg_epoch_loss = epoch_loss_total / max(epoch_loss_count, 1)
@@ -814,11 +1616,16 @@ def main():
                     accelerator,
                     global_step,
                     checkpoint_dir,
-                    max_checkpoints
+                    max_checkpoints,
+                    pipeline_step=pipeline_step,
                 )
             except KeyboardInterrupt:
                 accelerator.print("\nUscita forzata durante il salvataggio. Checkpoint temporaneo ignorato.\n")
                 cleanup_staging_checkpoints(checkpoint_dir)
+
+    if metrics_final_status == "interrupted":
+        accelerator.print("\nTraining interrotto dopo salvataggio checkpoint. Riavvia lo stesso step per riprendere.\n")
+        sys.exit(130)
 
     accelerator.print("\nTraining completato.")
 

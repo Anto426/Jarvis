@@ -21,6 +21,7 @@ function Initialize-JarvisEnvironment {
     $env:PYTHONPATH = $Root
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
+    $env:PYTHONUNBUFFERED = "1"
     $env:JARVIS_FORCE_IPV4 = "1"
     $env:HF_HUB_DISABLE_XET = "1"
 
@@ -226,6 +227,13 @@ function Invoke-JarvisTraining {
     $Accelerate = Get-JarvisAccelerate -Root $Root
     Push-Location $Root
     try {
+        Write-Host ""
+        Write-Host ">>> Avvio training Python"
+        Write-Host "Accelerate: $Accelerate"
+        Write-Host "Mixed precision: $MixedPrecision"
+        Write-Host "Working dir: $Root"
+        Write-Host "Comando: accelerate launch --mixed_precision=$MixedPrecision --num_processes=1 --num_machines=1 --dynamo_backend=$DynamoBackend training/train.py"
+
         & $Accelerate launch `
             --mixed_precision=$MixedPrecision `
             --num_processes=1 `

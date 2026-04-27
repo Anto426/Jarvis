@@ -35,14 +35,36 @@ $ManifestPath = Join-Path $ShardsDir ".jarvis_data_manifest.json"
 
 $env:JARVIS_USE_HUGGINGFACE = $HuggingFace
 $env:JARVIS_USE_HF_WIKIPEDIA = "0"
-$env:JARVIS_RAW_INCLUDE = "local_import.jsonl;wikipedia_it_wikimedia_direct.jsonl;fineweb2_it.jsonl;stackexchange_auto.jsonl"
-$env:JARVIS_CLEAN_INCLUDE = "local_import_clean.jsonl;wikipedia_it_wikimedia_direct_clean.jsonl;fineweb2_it_clean.jsonl;stackexchange_auto_clean.jsonl"
-$env:JARVIS_DEDUP_INCLUDE = "local_import_dedup.jsonl;wikipedia_it_wikimedia_direct_dedup.jsonl;fineweb2_it_dedup.jsonl;stackexchange_auto_dedup.jsonl"
+$env:JARVIS_RAW_INCLUDE = "local_import.jsonl;wikipedia_it_wikimedia_direct.jsonl;stackexchange_auto.jsonl"
+$env:JARVIS_CLEAN_INCLUDE = "local_import_clean.jsonl;wikipedia_it_wikimedia_direct_clean.jsonl;stackexchange_auto_clean.jsonl"
+$env:JARVIS_DEDUP_INCLUDE = "local_import_dedup.jsonl;wikipedia_it_wikimedia_direct_dedup.jsonl;stackexchange_auto_dedup.jsonl"
 $env:JARVIS_MIXED_PRECISION = "bf16_if_available"
 $env:JARVIS_FUSED_OPTIMIZER = "1"
 $env:JARVIS_TF32 = "1"
 $env:CUDA_MODULE_LOADING = "LAZY"
 $env:TORCH_CUDNN_V8_API_ENABLED = "1"
+if ($env:OS -eq "Windows_NT") {
+    Remove-Item Env:PYTORCH_CUDA_ALLOC_CONF -ErrorAction SilentlyContinue
+} else {
+    $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+}
+$CpuThreads = [Environment]::ProcessorCount
+$env:JARVIS_CPU_CORE_POLICY = "all_cores"
+$env:JARVIS_CPU_AFFINITY = "1"
+$env:JARVIS_CPU_PRIORITY = "above_normal"
+$env:JARVIS_CPU_THREADS = "auto"
+$env:JARVIS_CPU_INTEROP_THREADS = "2"
+$env:OMP_NUM_THREADS = "$CpuThreads"
+$env:MKL_NUM_THREADS = "$CpuThreads"
+$env:NUMEXPR_NUM_THREADS = "$CpuThreads"
+$env:NUMEXPR_MAX_THREADS = "$CpuThreads"
+$env:OMP_DYNAMIC = "FALSE"
+$env:MKL_DYNAMIC = "FALSE"
+Remove-Item Env:OMP_PROC_BIND -ErrorAction SilentlyContinue
+Remove-Item Env:OMP_PLACES -ErrorAction SilentlyContinue
+$env:KMP_AFFINITY = "granularity=fine,compact,1,0"
+$env:KMP_BLOCKTIME = "1"
+$env:KMP_SETTINGS = "0"
 
 if ($Turbo -or $MaxPerf) {
     $env:JARVIS_TORCH_COMPILE = "1"

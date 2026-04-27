@@ -21,7 +21,8 @@ def load_paths():
 
 def get_path(name, create=False):
     paths = load_paths()
-    path = resolve_project_path(paths[name])
+    env_name = f"JARVIS_PATH_{name.upper()}"
+    path = resolve_project_path(os.environ.get(env_name, paths[name]))
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path

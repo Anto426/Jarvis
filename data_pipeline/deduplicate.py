@@ -4,6 +4,7 @@ import hashlib
 import multiprocessing as mp
 from tqdm import tqdm
 from training.paths import get_path
+from data_pipeline.sample_format import normalize_sample, render_training_text
 
 # =========================
 # LOAD PATHS
@@ -35,8 +36,8 @@ def process_line(args):
     line, seen = args
 
     try:
-        sample = json.loads(line)
-        text = sample["text"]
+        sample = normalize_sample(json.loads(line))
+        text = render_training_text(sample)
     except:
         return None
 
@@ -78,8 +79,8 @@ def main():
         with open(input_path, "r", encoding="utf-8") as fin, open(output_path, "w", encoding="utf-8") as fout:
             for line in tqdm(fin):
                 try:
-                    sample = json.loads(line)
-                    text = sample["text"]
+                    sample = normalize_sample(json.loads(line))
+                    text = render_training_text(sample)
                 except Exception:
                     continue
 

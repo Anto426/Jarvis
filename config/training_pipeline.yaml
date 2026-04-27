@@ -1,0 +1,101 @@
+pipeline:
+  name: "Jarvis staged training"
+  state_db: "logs/pipeline_state.sqlite"
+  official_checkpoint_dir: "checkpoints/official"
+  strict_sequence: true
+
+  steps:
+    - id: "step_0_prepare"
+      order: 0
+      kind: "prepare"
+      title: "Preparazione iniziale"
+      objective: "Inizializzare database, tokenizer, vocabolario, struttura dati e ambiente."
+      raw_files:
+        - "local_import.jsonl"
+        - "wikipedia_it_wikimedia_direct.jsonl"
+        - "squad_it.jsonl"
+        - "piqa_italian.jsonl"
+        - "evol_instruct_italian.jsonl"
+        - "stackexchange_auto.jsonl"
+      allowed_languages: ["it", "en"]
+      data_profile: "prepare_all"
+      allowed_formats: ["text", "qa", "choice_qa", "instruction", "chat"]
+      actions:
+        - "init_db"
+        - "collect_sources"
+        - "clean"
+        - "deduplicate"
+        - "build_tokenizer_once"
+        - "tokenize_training_steps"
+        - "pack_training_steps"
+
+    - id: "step_1_italian_corpus"
+      order: 1
+      kind: "train"
+      title: "Corpus italiano puro"
+      objective: "Allenare solo testo libero in italiano da Wikipedia IT pulita, senza chat, Q/A, inglese, dati web rumorosi o dati tecnici."
+      requires: "step_0_prepare"
+      raw_files:
+        - "wikipedia_it_wikimedia_direct.jsonl"
+      allowed_languages: ["it"]
+      data_profile: "italian_lm"
+      allowed_formats: ["text"]
+      official_checkpoint: "italian_corpus"
+
+    - id: "step_2_italian_sft"
+      order: 2
+      kind: "train"
+      title: "Sintassi e logica delle frasi"
+      objective: "Consolidare italiano operativo, struttura delle frasi, domande/risposte e ragionamento semplice dopo il corpus italiano puro."
+      requires: "step_1_italian_corpus"
+      raw_files:
+        - "local_import.jsonl"
+        - "squad_it.jsonl"
+        - "piqa_italian.jsonl"
+      allowed_languages: ["it"]
+      data_profile: "italian_sft"
+      allowed_formats: ["text", "qa", "choice_qa", "instruction"]
+      official_checkpoint: "syntax_logic"
+
+    - id: "step_3_context_logic"
+      order: 3
+      kind: "train"
+      title: "Chat logica e istruzioni"
+      objective: "Aggiungere dialogo domanda-risposta, istruzioni complesse, ragionamento contestuale e risposte operative dopo il corpus italiano puro."
+      requires: "step_2_italian_sft"
+      raw_files:
+        - "evol_instruct_italian.jsonl"
+        - "squad_it.jsonl"
+        - "piqa_italian.jsonl"
+      allowed_languages: ["it"]
+      data_profile: "chat_logic_sft"
+      allowed_formats: ["chat", "instruction", "qa", "choice_qa"]
+      official_checkpoint: "chat_logic"
+
+    - id: "step_4_technical_automotive"
+      order: 4
+      kind: "train"
+      title: "Conoscenza tecnica e mondo reale"
+      objective: "Aggiungere automotive, OBD/OBD2, diagnostica, guasti, manutenzione e casi pratici."
+      requires: "step_3_context_logic"
+      raw_files:
+        - "local_import.jsonl"
+        - "stackexchange_auto.jsonl"
+      allowed_languages: ["it", "en"]
+      data_profile: "technical_sft"
+      allowed_formats: ["text", "qa", "instruction"]
+      official_checkpoint: "technical_automotive"
+
+    - id: "step_5_personality"
+      order: 5
+      kind: "train"
+      title: "Personalita finale"
+      objective: "Applicare un tono premium: elegante, preciso, professionale e naturale."
+      requires: "step_4_technical_automotive"
+      raw_files:
+        - "local_import.jsonl"
+        - "jarvis_personality.jsonl"
+      allowed_languages: ["it"]
+      data_profile: "personality_sft"
+      allowed_formats: ["chat", "instruction", "qa"]
+      official_checkpoint: "jarvis_personality"

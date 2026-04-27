@@ -1,11 +1,13 @@
 import json
 from training.paths import get_path
+from data_pipeline.sample_format import normalize_sample, render_training_text
 
 
 LOCAL_DIR = get_path("local_data_dir", create=True)
 RAW_DIR = get_path("raw_data_dir", create=True)
 OUTPUT_FILE = RAW_DIR / "local_import.jsonl"
 MIN_TEXT_LENGTH = 200
+MIN_STRUCTURED_TEXT_LENGTH = 40
 
 
 def iter_local_texts():
@@ -16,7 +18,12 @@ def iter_local_texts():
         if path.suffix.lower() == ".txt":
             text = path.read_text(encoding="utf-8", errors="ignore").strip()
             if len(text) >= MIN_TEXT_LENGTH:
-                yield {"text": text}
+                yield {
+                    "format": "text",
+                    "source": "local_import",
+                    "language": "it",
+                    "text": text,
+                }
 
         if path.suffix.lower() == ".jsonl":
             with path.open("r", encoding="utf-8") as f:
@@ -26,9 +33,21 @@ def iter_local_texts():
                     except json.JSONDecodeError:
                         continue
 
-                    text = sample.get("text", "")
-                    if len(text) >= MIN_TEXT_LENGTH:
-                        yield {"text": text}
+                    sample = normalize_sample(
+                        sample,
+                        source=sample.get("source", "local_import"),
+                        language=sample.get("language", "it"),
+                    )
+                    text = render_training_text(sample)
+                    min_length = (
+                        MIN_TEXT_LENGTH
+                        if sample.get("format") == "text"
+                        else MIN_STRUCTURED_TEXT_LENGTH
+                    )
+                    if len(text) >= min_length:
+                        if not sample.get("text"):
+                            sample["text"] = text
+                        yield sample
 
 
 def main():
