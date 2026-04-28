@@ -233,6 +233,7 @@ Key defaults:
 - Gradient accumulation: `16`
 - Gradient checkpointing: enabled
 - CUDA fast path: TF32, SDPA attention, fused optimizer
+- Async dataloader prefetch: automatic queue sized from CPU cores and available RAM
 - Max performance mode: `torch.compile` and automatic VRAM-based batch tuning
 - Checkpoint limit: `3`
 

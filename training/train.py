@@ -4,13 +4,17 @@ import yaml
 import time
 import torch
 import json
+import queue
+import ctypes
 import shutil
 import importlib.util
 import sys
+import threading
 from datetime import datetime, timezone
 from functools import partial
 from tqdm import tqdm
 from accelerate import Accelerator
+from accelerate.utils import send_to_device
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from safetensors.torch import load_file as load_safetensors
@@ -54,6 +58,154 @@ def env_int(name, default=None):
     if value is None or str(value).strip() == "":
         return default
     return int(value)
+
+
+def available_system_memory_bytes():
+    if os.name == "nt":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullAvailPhys)
+        except (AttributeError, OSError):
+            return None
+
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return int(pages * page_size)
+        except (AttributeError, OSError, ValueError):
+            return None
+
+    return None
+
+
+def estimate_prefetch_batch_bytes(train_cfg):
+    batch_size = max(1, int(train_cfg.get("per_device_batch_size", 1)))
+    sequence_length = train_cfg.get("max_sequence_length") or 2048
+    sequence_length = max(1, int(sequence_length))
+    tensor_count = 3
+    int64_bytes = 8
+    overhead = max(1.0, float(train_cfg.get("async_prefetch_memory_overhead", 4.0)))
+    return int(batch_size * sequence_length * tensor_count * int64_bytes * overhead)
+
+
+def auto_async_prefetch_batches(train_cfg, cpu_runtime=None):
+    max_batches = max(0, int(train_cfg.get("async_prefetch_max_batches", 8)))
+    if max_batches <= 0:
+        return 0
+
+    min_batches = max(1, int(train_cfg.get("async_prefetch_min_batches", 2)))
+    selected_cores = os.cpu_count() or 1
+    if cpu_runtime:
+        topology = cpu_runtime.get("cpu_topology") or {}
+        selected_cores = int(topology.get("selected_count") or selected_cores)
+
+    core_limited = max(1, selected_cores // 2)
+    available_memory = available_system_memory_bytes()
+    if available_memory:
+        ram_fraction = float(train_cfg.get("async_prefetch_ram_fraction", 0.05))
+        ram_budget = max(1, int(available_memory * max(0.0, ram_fraction)))
+        batch_bytes = max(1, estimate_prefetch_batch_bytes(train_cfg))
+        ram_limited = max(1, ram_budget // batch_bytes)
+    else:
+        ram_limited = max_batches
+
+    resolved = min(max_batches, core_limited, ram_limited)
+    if resolved < min_batches:
+        return max(1, resolved)
+    return resolved
+
+
+class AsyncPrefetchLoader:
+    def __init__(self, loader, buffer_size):
+        self.loader = loader
+        self.base_dataloader = loader
+        self.buffer_size = max(1, int(buffer_size))
+        self.async_prefetch_batches = self.buffer_size
+        self.num_workers = getattr(loader, "num_workers", None)
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __getattr__(self, name):
+        return getattr(self.loader, name)
+
+    def __iter__(self):
+        batch_queue = queue.Queue(maxsize=self.buffer_size)
+        stop_event = threading.Event()
+        sentinel = object()
+        errors = []
+
+        def put_until_ready(item):
+            while not stop_event.is_set():
+                try:
+                    batch_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer():
+            try:
+                for batch in self.loader:
+                    if not put_until_ready(batch):
+                        break
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                put_until_ready(sentinel)
+
+        thread = threading.Thread(
+            target=producer,
+            name="jarvis-dataloader-prefetch",
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            while True:
+                item = batch_queue.get()
+                if item is sentinel:
+                    if errors:
+                        raise errors[0]
+                    break
+                yield item
+        finally:
+            stop_event.set()
+            while True:
+                try:
+                    batch_queue.get_nowait()
+                except queue.Empty:
+                    break
+            thread.join(timeout=1.0)
+
+
+def async_prefetch_batches(train_cfg, cpu_runtime=None):
+    value = os.environ.get(
+        "JARVIS_ASYNC_PREFETCH_BATCHES",
+        train_cfg.get("async_prefetch_batches", 0),
+    )
+    normalized = str(value).strip().lower()
+    if normalized in {"", "0", "false", "no", "off", "none", "disabled"}:
+        return 0
+    if normalized in {"auto", "dynamic", "ram", "cores"}:
+        return auto_async_prefetch_batches(train_cfg, cpu_runtime)
+    return max(0, int(value))
 
 
 def resolve_cpu_thread_value(value, selected_count, total_logical, default=None):
@@ -192,6 +344,158 @@ def early_startup_banner():
     console_print("")
 
 
+def yaml_file_payload(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        return {"_error": str(exc)}
+
+
+def make_yaml_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_yaml_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_yaml_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def jarvis_environment_snapshot():
+    prefixes = (
+        "JARVIS_",
+        "PYTORCH_",
+        "CUDA_",
+        "HF_",
+        "TRANSFORMERS_",
+        "OMP_",
+        "MKL_",
+        "NUMEXPR_",
+    )
+    return {
+        key: os.environ[key]
+        for key in sorted(os.environ)
+        if key.startswith(prefixes)
+    }
+
+
+def resolved_paths_snapshot():
+    keys = (
+        "cache_dir",
+        "hf_home",
+        "datasets_cache_dir",
+        "torch_home",
+        "raw_data_dir",
+        "local_data_dir",
+        "cleaned_data_dir",
+        "shards_dir",
+        "tokenizer_dir",
+        "model_output_dir",
+        "final_model_dir",
+        "logs_dir",
+    )
+    return {key: str(get_path(key, create=False)) for key in keys}
+
+
+def effective_config_payload(
+    train_cfg,
+    pipeline_step,
+    cpu_runtime=None,
+    mixed_precision=None,
+    attention_impl=None,
+    checkpoint_dir=None,
+    logs_dir=None,
+    total_steps=None,
+):
+    return make_yaml_safe(
+        {
+            "config_files": {
+                "training": {"training": train_cfg},
+                "model": yaml_file_payload("config/model.yaml"),
+                "paths": yaml_file_payload("config/paths.yaml"),
+                "training_pipeline": yaml_file_payload("config/training_pipeline.yaml"),
+            },
+            "active_pipeline_step": pipeline_step or {},
+            "resolved": {
+                "mixed_precision": mixed_precision,
+                "attention_implementation": attention_impl,
+                "checkpoint_dir": checkpoint_dir,
+                "logs_dir": logs_dir,
+                "total_steps": total_steps,
+                "paths": resolved_paths_snapshot(),
+                "cpu_runtime": cpu_runtime or {},
+                "cuda_available": torch.cuda.is_available(),
+                "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+            },
+            "environment": jarvis_environment_snapshot(),
+        }
+    )
+
+
+def effective_config_text(
+    train_cfg,
+    pipeline_step,
+    cpu_runtime=None,
+    mixed_precision=None,
+    attention_impl=None,
+    checkpoint_dir=None,
+    logs_dir=None,
+    total_steps=None,
+):
+    payload = effective_config_payload(
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        cpu_runtime=cpu_runtime,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+        total_steps=total_steps,
+    )
+    return yaml.safe_dump(payload, sort_keys=False, allow_unicode=True, width=120)
+
+
+def print_effective_config(
+    train_cfg,
+    pipeline_step,
+    cpu_runtime=None,
+    mixed_precision=None,
+    attention_impl=None,
+    checkpoint_dir=None,
+    logs_dir=None,
+    total_steps=None,
+    emit_console=True,
+):
+    text = effective_config_text(
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        cpu_runtime=cpu_runtime,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+        total_steps=total_steps,
+    )
+    if emit_console:
+        console_print("")
+        console_print("=" * 78)
+        console_print("JARVIS EFFECTIVE CONFIG")
+        console_print("=" * 78)
+        console_print(text.rstrip())
+        console_print("=" * 78)
+        console_print("")
+
+    if logs_dir:
+        try:
+            config_path = logs_dir / "training_effective_config.yaml"
+            config_path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
+    return text
+
+
 def init_metrics(logs_dir, train_cfg, total_steps, start_global_step, pipeline_step=None):
     metrics_path = logs_dir / "training_metrics.json"
     previous = {}
@@ -250,6 +554,8 @@ def init_metrics(logs_dir, train_cfg, total_steps, start_global_step, pipeline_s
             "cpu_interop_threads": train_cfg.get("cpu_interop_threads"),
             "cpu_core_policy": train_cfg.get("cpu_core_policy"),
             "cpu_priority": train_cfg.get("cpu_priority"),
+            "async_prefetch_batches": train_cfg.get("async_prefetch_batches"),
+            "resolved_async_prefetch_batches": train_cfg.get("resolved_async_prefetch_batches"),
             "pipeline_step": (pipeline_step or {}).get("id"),
         },
         "history": history,
@@ -305,6 +611,10 @@ def override_from_env(train_cfg):
         value = os.environ.get(env_name)
         if value:
             train_cfg[cfg_name] = int(value)
+
+    value = os.environ.get("JARVIS_ASYNC_PREFETCH_BATCHES")
+    if value:
+        train_cfg["async_prefetch_batches"] = value.strip()
 
 
 def configure_cuda_fast_path(train_cfg):
@@ -914,18 +1224,49 @@ def cuda_startup_lines():
 
 
 def dataloader_workers(loader):
-    for name in ("num_workers",):
-        value = getattr(loader, name, None)
+    current = loader
+    seen = set()
+    for _ in range(5):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+
+        value = getattr(current, "num_workers", None)
         if value is not None:
             return value
 
-    for name in ("base_dataloader", "dataloader"):
-        nested = getattr(loader, name, None)
-        value = getattr(nested, "num_workers", None)
-        if value is not None:
-            return value
+        for name in ("base_dataloader", "dataloader", "loader"):
+            nested = getattr(current, name, None)
+            if nested is not None and nested is not current:
+                current = nested
+                break
+        else:
+            break
 
     return "?"
+
+
+def dataloader_async_prefetch(loader):
+    current = loader
+    seen = set()
+    for _ in range(5):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+
+        value = getattr(current, "async_prefetch_batches", None)
+        if value is not None:
+            return value
+
+        for name in ("base_dataloader", "dataloader", "loader"):
+            nested = getattr(current, name, None)
+            if nested is not None and nested is not current:
+                current = nested
+                break
+        else:
+            break
+
+    return 0
 
 
 def startup_summary(
@@ -992,6 +1333,7 @@ def startup_summary(
         f"Checkpoint dir: {checkpoint_dir}",
         f"Logs dir: {logs_dir}",
         f"Metrics file: {metrics_path}",
+        f"Effective config file: {logs_dir / 'training_effective_config.yaml'}",
         "-" * 78,
         "HARDWARE",
         *cuda_startup_lines(),
@@ -1032,6 +1374,8 @@ def startup_summary(
         f"Dataloader workers: train={dataloader_workers(train_loader)} | "
         f"val={dataloader_workers(val_loader)} | "
         f"pin_memory={bool(train_cfg['pin_memory'])} | drop_last={bool(train_cfg.get('drop_last', True))}",
+        f"Async prefetch batches: train={dataloader_async_prefetch(train_loader)} | "
+        f"config={train_cfg.get('async_prefetch_batches', 0)}",
         "-" * 78,
         "RUN CONTROL",
         f"Epochs: {train_cfg['num_train_epochs']} | max_steps={train_cfg.get('max_steps')}",
@@ -1122,14 +1466,29 @@ def main():
     override_from_env(train_cfg)
     configure_cuda_fast_path(train_cfg)
     cpu_runtime = configure_cpu_fast_path(train_cfg)
+    train_cfg["resolved_async_prefetch_batches"] = async_prefetch_batches(
+        train_cfg,
+        cpu_runtime,
+    )
 
     mixed_precision = resolve_mixed_precision(train_cfg["mixed_precision"])
     checkpoint_dir = get_path("model_output_dir", create=True)
+    logs_dir = get_path("logs_dir", create=True)
     max_checkpoints = int(train_cfg.get("save_total_limit", 2))
     cleanup_staging_checkpoints(checkpoint_dir)
 
-    dataset, val_dataset = load_training_dataset(split_validation=True)
     attention_impl = resolve_attention_implementation(train_cfg)
+    print_effective_config(
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        cpu_runtime=cpu_runtime,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+    )
+
+    dataset, val_dataset = load_training_dataset(split_validation=True)
 
     model = initialize_model(
         device=None,
@@ -1163,6 +1522,16 @@ def main():
             clear_active_checkpoints(checkpoint_dir)
 
     autotune_batch_size(model, train_cfg, mixed_precision)
+    print_effective_config(
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        cpu_runtime=cpu_runtime,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+        emit_console=False,
+    )
 
     accumulation_steps = int(train_cfg["gradient_accumulation_steps"])
     accelerator = Accelerator(
@@ -1309,6 +1678,17 @@ def main():
     total_steps = math.ceil(len(train_loader) / accumulation_steps) * train_cfg["num_train_epochs"]
     if train_cfg.get("max_steps") is not None:
         total_steps = min(total_steps, int(train_cfg["max_steps"]))
+    print_effective_config(
+        train_cfg=train_cfg,
+        pipeline_step=pipeline_step,
+        cpu_runtime=cpu_runtime,
+        mixed_precision=mixed_precision,
+        attention_impl=attention_impl,
+        checkpoint_dir=checkpoint_dir,
+        logs_dir=logs_dir,
+        total_steps=total_steps,
+        emit_console=False,
+    )
 
     scheduler = build_scheduler(
         optimizer,
@@ -1316,9 +1696,26 @@ def main():
         train_cfg["warmup_ratio"]
     )
 
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, scheduler
-    )
+    prefetch_batches = int(train_cfg.get("resolved_async_prefetch_batches", 0))
+    manual_device_placement = prefetch_batches > 0
+    if manual_device_placement:
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+        train_loader, val_loader = accelerator.prepare(
+            train_loader,
+            val_loader,
+            device_placement=[False, False],
+        )
+        train_loader = AsyncPrefetchLoader(train_loader, prefetch_batches)
+        accelerator.print(
+            "\nAsync dataloader prefetch attivo: "
+            f"{prefetch_batches} batch in coda "
+            f"(config={train_cfg.get('async_prefetch_batches')}), "
+            "device move nel thread principale.\n"
+        )
+    else:
+        model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+            model, optimizer, train_loader, val_loader, scheduler
+        )
 
     global_step = 0
     restored_checkpoint = None
@@ -1402,7 +1799,6 @@ def main():
     slow_step_seconds = float(train_cfg.get("slow_step_seconds", 60))
     slow_step_seconds = env_float("JARVIS_SLOW_STEP_SECONDS", slow_step_seconds)
 
-    logs_dir = get_path("logs_dir", create=True)
     metrics_path = None
     metrics = None
     if accelerator.is_main_process:
@@ -1469,7 +1865,13 @@ def main():
             for step, batch in enumerate(progress):
                 batch_ready_time = time.time()
                 fetch_seconds = batch_ready_time - last_batch_end_time
-                compute_start_time = batch_ready_time
+                if manual_device_placement:
+                    batch = send_to_device(
+                        batch,
+                        accelerator.device,
+                        non_blocking=bool(train_cfg["pin_memory"]),
+                    )
+                compute_start_time = time.time()
 
                 if INTERRUPT_REQUESTED:
                     accelerator.print("\nStop richiesto: salvo checkpoint e chiudo.\n")
@@ -1695,6 +2097,12 @@ def main():
                                 for val_batch in val_loader:
                                     if eval_max_batches and eval_steps >= eval_max_batches:
                                         break
+                                    if manual_device_placement:
+                                        val_batch = send_to_device(
+                                            val_batch,
+                                            accelerator.device,
+                                            non_blocking=bool(train_cfg["pin_memory"]),
+                                        )
                                     with accelerator.autocast():
                                         val_out = model(
                                             input_ids=val_batch["input_ids"],
